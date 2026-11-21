@@ -6,7 +6,7 @@ use crate::ui::assets::UiAssets;
 use crate::ui::browser::{BrowserActions, BrowserState};
 use crate::ui::control_bar::{ControlBarActions, ControlBarState};
 use crate::ui::panel::PanelRenderer;
-use crate::ui::settings::{SettingsActions, VideoSettings};
+use crate::ui::settings::{SettingsActions, SettingsView, VideoSettings};
 use crate::video::texture::VideoTexture;
 use crate::video_layer::VideoSwapchain;
 use crate::video_renderer::VideoRenderer;
@@ -47,7 +47,7 @@ pub trait Mode {
         video_shader:     Option<(&VideoRenderer, &VideoTexture, &VideoSettings)>,
         panel:            Option<(&mut PanelRenderer, &ControlBarState)>,
         browser:          Option<(&mut PanelRenderer, &mut BrowserState)>,
-        settings:         Option<(&mut PanelRenderer, &mut VideoSettings)>,
+        settings:         Option<(&mut PanelRenderer, SettingsView<'_>)>,
         pointer_renderer: Option<&PointerRenderer>,
     ) -> (ControlBarActions, BrowserActions, SettingsActions);
 
@@ -60,6 +60,15 @@ pub trait Mode {
     /// Forward a winit window event so the mode can update its input state.
     /// VR mode ignores this entirely.
     fn handle_window_event(&mut self, _event: &WindowEvent) {}
+
+    /// Forward a raw device event (mouse motion).  Only the headset mode uses it.
+    fn handle_device_event(&mut self, _event: &winit::event::DeviceEvent) {}
+
+    /// The window grabbed (true) or released (false) the desktop mouse for the headset panels.
+    fn set_mouse_active(&mut self, _on: bool) {}
+
+    /// Put the screen and panels in front of the viewer, where they look now (headset only).
+    fn center(&mut self) {}
 
     /// True when the mode renders directly to the desktop window surface (i.e.
     /// the App should not also draw the logo there).

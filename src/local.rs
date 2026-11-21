@@ -2,6 +2,7 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::desk_input::DeskInput;
 use crate::input::ControllerState;
 use crate::mode::Mode;
 use crate::pointer_renderer::PointerRenderer;
@@ -10,7 +11,7 @@ use crate::ui::assets::UiAssets;
 use crate::ui::browser::{BrowserActions, BrowserState, draw as browser_draw};
 use crate::ui::control_bar::{ControlBarActions, ControlBarState};
 use crate::ui::panel::PanelRenderer;
-use crate::ui::settings::{SettingsActions, VideoSettings, draw as settings_draw};
+use crate::ui::settings::{SettingsActions, SettingsView, VideoSettings, draw as settings_draw};
 use crate::video::texture::VideoTexture;
 use crate::video_layer::VideoSwapchain;
 use crate::video_renderer::VideoRenderer;
@@ -47,8 +48,8 @@ pub struct LocalMode {
     window_w: u32,
     window_h: u32,
 
-    /// Edge-triggered: M key press, consumed once per render_frame.
-    menu_toggle_pending: bool,
+    /// Keyboard shortcuts shared with the headset mode (the mouse stays LocalMode's own).
+    desk: DeskInput,
     /// Set by Esc; surfaced via `exit_requested()`.
     exit_pending: bool,
 }
@@ -65,7 +66,7 @@ impl LocalMode {
             clicking:  false,
             window_w:  size.width.max(1),
             window_h:  size.height.max(1),
-            menu_toggle_pending: false,
+            desk:                DeskInput::new(false),
             exit_pending:        false,
         }
     }
@@ -104,6 +105,7 @@ impl LocalMode {
             thumbstick_y: 0.0,
             menu_pressed: false,
             grip_pressed: false,
+            is_mouse:     false,
         }
     }
 
@@ -139,10 +141,12 @@ impl Mode for LocalMode {
     fn exit_requested(&self) -> bool { self.exit_pending }
 
     // All panels render at (0, 0, -2) so they're always centred on screen.
+    fn control_bar_position(&self) -> glam::Vec3 { glam::Vec3::new(0.0, 0.0, -2.0) }
     fn browser_position(&self)  -> glam::Vec3 { glam::Vec3::new(0.0, 0.0, -2.0) }
     fn settings_position(&self) -> glam::Vec3 { glam::Vec3::new(0.0, 0.0, -2.0) }
 
     fn handle_window_event(&mut self, event: &WindowEvent) {
+        self.desk.handle_window_event(event);
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 if self.rotating {
@@ -166,7 +170,6 @@ impl Mode for LocalMode {
                 if event.state == ElementState::Pressed && !event.repeat {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         match code {
-                            KeyCode::KeyM   => self.menu_toggle_pending = true,
                             KeyCode::Escape => self.exit_pending        = true,
                             _ => {}
                         }
@@ -189,20 +192,18 @@ impl Mode for LocalMode {
         video_shader:      Option<(&VideoRenderer, &VideoTexture, &VideoSettings)>,
         mut panel:         Option<(&mut PanelRenderer, &ControlBarState)>,
         mut browser:       Option<(&mut PanelRenderer, &mut BrowserState)>,
-        mut settings:      Option<(&mut PanelRenderer, &mut VideoSettings)>,
+        mut settings:      Option<(&mut PanelRenderer, SettingsView<'_>)>,
         _pointer_renderer: Option<&PointerRenderer>,
     ) -> (ControlBarActions, BrowserActions, SettingsActions) {
-        let menu_toggle = std::mem::take(&mut self.menu_toggle_pending);
-
         let cursor      = self.cursor_controller();
-        let controllers = [Some(cursor), None];
+        let controllers = [Some(cursor), None, None];
 
         // Update UI textures (CPU-side draw build + GPU upload).
         let mut cb_actions = match &mut panel {
             Some((p, s)) => p.update(&renderer.device, &renderer.queue, ui_assets, s, &controllers),
             None => ControlBarActions::default(),
         };
-        cb_actions.menu_toggle = menu_toggle;
+        self.desk.apply_keys(&mut cb_actions);
 
         let browser_actions = match &mut browser {
             Some((p, s)) => p.update_ui(

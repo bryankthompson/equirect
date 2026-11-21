@@ -22,6 +22,8 @@ pub struct ControllerState {
     pub menu_pressed: bool,
     /// Grip / squeeze button.
     pub grip_pressed: bool,
+    /// The desktop mouse (not a hand): the panel draws a dot for it instead of a beam.
+    pub is_mouse: bool,
 }
 
 /// Manages OpenXR action sets for both hand controllers.
@@ -117,6 +119,35 @@ impl XrInput {
                         xr::Binding::new(&grip_action,        rg),
                     ],
                 );
+            }
+        }
+
+        // ── Vive wand and Index controllers (added: the Touch profile maps A/X to the
+        // Vive menu button, so the trigger did nothing) ─────────────────────────────
+        // Each row: profile, click path, 2-D stick path, menu path, grip path.
+        let extra: [(&str, &str, &str, &str, &str); 2] = [
+            ("/interaction_profiles/htc/vive_controller",
+             "trigger/click", "trackpad", "menu/click", "squeeze/click"),
+            ("/interaction_profiles/valve/index_controller",
+             "trigger/click", "thumbstick", "b/click", "squeeze/value"),
+        ];
+        for (profile_s, click_s, stick_s, menu_s, grip_s) in extra {
+            let Ok(profile) = instance.string_to_path(profile_s) else { continue };
+            let mut bindings: Vec<xr::Binding> = Vec::new();
+            for hand in ["left", "right"] {
+                let p = |leaf: &str| instance.string_to_path(&format!("/user/hand/{hand}/input/{leaf}")).ok();
+                if let (Some(a), Some(c), Some(s), Some(m), Some(g)) =
+                    (p("aim/pose"), p(click_s), p(stick_s), p(menu_s), p(grip_s))
+                {
+                    bindings.push(xr::Binding::new(&pose_action, a));
+                    bindings.push(xr::Binding::new(&click_action, c));
+                    bindings.push(xr::Binding::new(&thumbstick_action, s));
+                    bindings.push(xr::Binding::new(&menu_action, m));
+                    bindings.push(xr::Binding::new(&grip_action, g));
+                }
+            }
+            if let Err(e) = instance.suggest_interaction_profile_bindings(profile, &bindings) {
+                eprintln!("XR input: suggest bindings for {profile_s}: {e}");
             }
         }
 
@@ -225,6 +256,7 @@ impl XrInput {
             out[i] = Some(ControllerState {
                 ray_origin, ray_dir, pose_valid,
                 clicking, thumbstick_x, thumbstick_y, menu_pressed, grip_pressed,
+                is_mouse: false,
             });
         }
         out

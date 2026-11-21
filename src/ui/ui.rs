@@ -38,11 +38,16 @@ pub const FONT_TINY:       f32 = 12.0;
 
 // ── Cursor input ──────────────────────────────────────────────────────────────
 
+/// Pointers the UI listens to: left hand, right hand, desktop mouse.
+pub const N_CURSORS: usize = 3;
+
 #[derive(Copy, Clone, Default)]
 pub struct CursorInput {
     /// Pixel position on the panel.  `None` if the cursor doesn't hit it.
     pub pos:      Option<(f32, f32)>,
     pub clicking: bool,
+    /// The desktop mouse: it has no beam in the headset, so the panel draws a dot for it.
+    pub is_mouse: bool,
     /// Vertical scroll input (pixels per frame).  Positive scrolls down.
     /// Drives `scroll_area` when any cursor hovers it.
     pub scroll_y: f32,
@@ -55,10 +60,12 @@ type Interaction = ((f32, f32), (f32, f32));
 
 #[derive(Default)]
 pub struct UiState {
-    prev_clicking: [bool; 2],
-    press_pos:     [Option<(f32, f32)>; 2],
+    prev_clicking: [bool; N_CURSORS],
+    press_pos:     [Option<(f32, f32)>; N_CURSORS],
     /// Which cursor (0 or 1) currently owns a drag, keyed by widget ID.
     drag:          HashMap<u64, u8>,
+    /// For a two-handle slider: which handle (0 = low, 1 = high) the drag grabbed, keyed by widget ID.
+    drag_handle:   HashMap<u64, u8>,
     /// Saved scroll offsets, keyed by scroll-area ID.
     scroll_y:      HashMap<u64, f32>,
     /// Pan-drag (touch-style swipe inside scroll content): per scroll-area ID,
@@ -110,8 +117,8 @@ pub struct Ui<'a> {
     layouts:     Vec<LayoutCtx>,
     next_id:     u64,
 
-    cursors:     [CursorInput; 2],
-    interactions:[Option<Interaction>; 2],
+    cursors:     [CursorInput; N_CURSORS],
+    interactions:[Option<Interaction>; N_CURSORS],
 
     enabled:     bool,
 }
@@ -124,11 +131,11 @@ pub fn begin_frame<'a>(
     draw:       &'a mut DrawList,
     atlas:      &'a mut GlyphAtlas,
     panel_size: (f32, f32),
-    cursors:    [CursorInput; 2],
+    cursors:    [CursorInput; N_CURSORS],
 ) -> Ui<'a> {
     // Update click tracking and emit (press, release) pairs on the release frame.
-    let mut interactions: [Option<Interaction>; 2] = [None, None];
-    for i in 0..2 {
+    let mut interactions: [Option<Interaction>; N_CURSORS] = [None; N_CURSORS];
+    for i in 0..N_CURSORS {
         let now  = cursors[i].clicking;
         let prev = state.prev_clicking[i];
         let pos  = cursors[i].pos;
@@ -340,6 +347,20 @@ impl Ui<'_> {
 
     // ── input queries ─────────────────────────────────────────────────────────
 
+    /// The part of `rect` that can be seen and clicked: inside the scroll area's viewport, not hidden above or below it. A row
+    /// scrolled out of sight still has a rect, and without this a click on the header over it would press the hidden row too.
+    pub fn visible_part(&self, rect: Rect) -> Rect {
+        match self.draw.current_clip() {
+            Some(clip) => rect.intersect(clip),
+            None => rect,
+        }
+    }
+
+    /// Height of one line of text at `font_size`.
+    pub fn line_height(&mut self, font_size: f32) -> f32 {
+        self.atlas.line_height(font_size).ceil()
+    }
+
     /// True if any cursor is currently inside `rect`.
     pub fn hovered(&self, rect: Rect) -> bool {
         if !self.enabled { return false; }
@@ -352,7 +373,7 @@ impl Ui<'_> {
     /// True if any cursor is currently held down inside `rect` (for "active" visuals).
     pub fn pressed(&self, rect: Rect) -> bool {
         if !self.enabled { return false; }
-        for i in 0..2 {
+        for i in 0..N_CURSORS {
             if self.cursors[i].clicking {
                 if let Some((x, y)) = self.cursors[i].pos {
                     if rect.contains(x, y) {
@@ -409,6 +430,15 @@ impl Ui<'_> {
     }
 
     pub fn button_styled(&mut self, text: &str, font_size: f32) -> bool {
+        self.button_impl(text, font_size, false)
+    }
+
+    /// A text button that stays highlighted while `selected`: a tab, or an on/off switch.
+    pub fn toggle_button(&mut self, text: &str, selected: bool) -> bool {
+        self.button_impl(text, FONT_DEFAULT, selected)
+    }
+
+    fn button_impl(&mut self, text: &str, font_size: f32, selected: bool) -> bool {
         let text_w = self.atlas.measure(text, font_size).ceil();
         let pad_x  = 12.0;
         let pad_y  = 6.0;
@@ -417,7 +447,11 @@ impl Ui<'_> {
         let w      = text_w + pad_x * 2.0;
 
         let rect = self.allocate(w, h);
-        self.paint_button(rect, false);
+        if selected && self.enabled {
+            self.draw.rect(rect, BTN_BG_SELECTED);
+        } else {
+            self.paint_button(rect, false);
+        }
         // Centre the text inside the rect.
         let ascent  = self.atlas.ascent(font_size);
         let base_y  = rect.y + (rect.h - line_h) * 0.5 + ascent;
@@ -458,6 +492,87 @@ impl Ui<'_> {
         let tint = if self.enabled { Color::rgba(1.0, 1.0, 1.0, 1.0) } else { Color::rgba(1.0, 1.0, 1.0, 0.4) };
         self.draw.sprite(icon_rect, uv, tint);
 
+        self.activated(rect)
+    }
+
+    /// A heart button drawn from squares (no icon sheet entry needed): red when `on`, grey when off.
+    pub fn heart_button(&mut self, size: f32, on: bool) -> bool {
+        const HEART: [&str; 7] = [
+            ".##.##.",
+            "#######",
+            "#######",
+            "#######",
+            ".#####.",
+            "..###..",
+            "...#...",
+        ];
+        let pad_x = 8.0;
+        let pad_y = 6.0;
+        let rect  = self.allocate(size + pad_x * 2.0, size + pad_y * 2.0);
+        self.paint_button(rect, false);
+
+        let cell = (size / 9.0).floor().max(1.0);
+        let x0 = (rect.x + (rect.w - cell * 7.0) * 0.5).round();
+        let y0 = (rect.y + (rect.h - cell * 7.0) * 0.5).round();
+        let color = if !self.enabled {
+            Color::rgba(0.4, 0.4, 0.4, 0.4)
+        } else if on {
+            Color::rgba(1.0, 0.25, 0.35, 1.0)
+        } else {
+            Color::rgba(0.55, 0.58, 0.64, 1.0)
+        };
+        for (row, line) in HEART.iter().enumerate() {
+            for (col, ch) in line.bytes().enumerate() {
+                if ch == b'#' {
+                    self.draw.rect(Rect::new(x0 + col as f32 * cell, y0 + row as f32 * cell, cell, cell), color);
+                }
+            }
+        }
+        self.activated(rect)
+    }
+
+    /// A speaker, drawn in pixel blocks like the heart: sound on, or crossed out and red when `muted`. True when clicked.
+    pub fn speaker_button(&mut self, size: f32, muted: bool) -> bool {
+        const ON: [&str; 7] = [
+            "...#.....",
+            "..##...#.",
+            "####.#.#.",
+            "####.#.#.",
+            "####.#.#.",
+            "..##...#.",
+            "...#.....",
+        ];
+        const OFF: [&str; 7] = [
+            "...#.....",
+            "..##.....",
+            "####.#.#.",
+            "####..#..",
+            "####.#.#.",
+            "..##.....",
+            "...#.....",
+        ];
+        let pad_x = 8.0;
+        let pad_y = 6.0;
+        let rect  = self.allocate(size + pad_x * 2.0, size + pad_y * 2.0);
+        self.paint_button(rect, false);
+
+        let cell = (size / 10.0).floor().max(1.0);
+        let x0 = (rect.x + (rect.w - cell * 9.0) * 0.5).round();
+        let y0 = (rect.y + (rect.h - cell * 7.0) * 0.5).round();
+        let color = if !self.enabled {
+            Color::rgba(0.4, 0.4, 0.4, 0.4)
+        } else if muted {
+            Color::rgba(1.0, 0.35, 0.35, 1.0)
+        } else {
+            Color::rgba(0.55, 0.58, 0.64, 1.0)
+        };
+        for (row, line) in (if muted { OFF } else { ON }).iter().enumerate() {
+            for (col, ch) in line.bytes().enumerate() {
+                if ch == b'#' {
+                    self.draw.rect(Rect::new(x0 + col as f32 * cell, y0 + row as f32 * cell, cell, cell), color);
+                }
+            }
+        }
         self.activated(rect)
     }
 
@@ -504,6 +619,22 @@ impl Ui<'_> {
         }
     }
 
+    /// Draw a dot where the desktop mouse points (it has no beam in the headset).
+    /// Call last, so it paints over everything else.
+    pub fn draw_mouse_cursor(&mut self) {
+        for i in 0..N_CURSORS {
+            let c = self.cursors[i];
+            if !c.is_mouse { continue; }
+            if let Some((x, y)) = c.pos {
+                let d = if c.clicking { 12.0 } else { 16.0 };
+                self.draw.rect(Rect::new(x - d * 0.5 - 2.0, y - d * 0.5 - 2.0, d + 4.0, d + 4.0),
+                               Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 });
+                self.draw.rect(Rect::new(x - d * 0.5, y - d * 0.5, d, d),
+                               if c.clicking { ACCENT } else { Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 } });
+            }
+        }
+    }
+
     /// Horizontal slider over `value` clamped to [min, max].  Continuous drag:
     /// while a cursor is held inside the track, value follows the cursor.
     /// Returns true on any frame the value changes.
@@ -514,6 +645,12 @@ impl Ui<'_> {
     }
 
     pub fn slider_sized(&mut self, width: f32, value: &mut f32, min: f32, max: f32) -> bool {
+        self.slider_sized_heat(width, value, min, max, &[])
+    }
+
+    /// A slider with a heat strip above its track: one colour cell per entry of `heat` (0 cold, 255 hot), left to right.
+    /// An empty `heat` draws no strip. True when the value changed.
+    pub fn slider_sized_heat(&mut self, width: f32, value: &mut f32, min: f32, max: f32, heat: &[u8]) -> bool {
         let id     = self.next_id();
         // The full row is the hit area; the track is the painted bar inside it.
         // Both are deliberately tall: in VR a 22 px bar was too thin to grab.
@@ -537,7 +674,7 @@ impl Ui<'_> {
             }
         } else {
             let mut found = None;
-            for i in 0..2 {
+            for i in 0..N_CURSORS {
                 if self.cursors[i].clicking {
                     if let Some(p) = self.state.press_pos[i] {
                         if rect.contains(p.0, p.1) && self.enabled {
@@ -566,15 +703,96 @@ impl Ui<'_> {
 
         // Draw track + fill + thumb.
         let frac = ((*value - min) / (max - min).max(1e-6)).clamp(0.0, 1.0);
+        if !heat.is_empty() {
+            let cell = rect.w / heat.len() as f32;
+            for (i, &v) in heat.iter().enumerate() {
+                // A hair wider than the cell, so no gap shows between two of them.
+                self.draw.rect(Rect::new(rect.x + i as f32 * cell, rect.y + 2.0, cell + 0.5, 10.0), heat_color(v));
+            }
+        }
         self.draw.rect(track, SLIDER_TRACK);
         let fill_w = track.w * frac;
         self.draw.rect(Rect::new(track.x, track.y, fill_w, track.h), SLIDER_FILL);
-        let thumb_w = 14.0;
+        // Wider, accent-coloured playhead while a cursor is over the row or drags it.
+        let lit     = active_cursor.is_some() || self.hovered(rect);
+        let thumb_w = if lit { 18.0 } else { 14.0 };
         let thumb_h = h - 4.0;
         let thumb_x = track.x + track.w * frac - thumb_w * 0.5;
         let thumb_y = rect.y + 2.0;
-        self.draw.rect(Rect::new(thumb_x, thumb_y, thumb_w, thumb_h), SLIDER_THUMB);
+        self.draw.rect(Rect::new(thumb_x, thumb_y, thumb_w, thumb_h),
+                       if lit { ACCENT } else { SLIDER_THUMB });
 
+        changed
+    }
+
+    /// A slider with two thumbs on one track: moves `lo` and `hi` (kept at least `gap` apart; a thumb pushes the other
+    /// one along). A press grabs the thumb nearest to it, or, with both on one spot, the one on the pressed side.
+    /// Returns true on any change.
+    pub fn range_slider_sized(&mut self, width: f32, lo: &mut f32, hi: &mut f32, min: f32, max: f32, gap: f32) -> bool {
+        let id    = self.next_id();
+        let h     = 22.0;
+        let rect  = self.allocate(width, h);
+        let track = rect.shrink(0.0, 8.0);
+        let grab  = Rect::new(rect.x - 12.0, rect.y - 14.0, rect.w + 24.0, rect.h + 28.0);
+        let span  = (max - min).max(1e-6);
+        let x_of  = |v: f32| track.x + track.w * ((v - min) / span).clamp(0.0, 1.0);
+
+        let mut changed = false;
+        let dragging_cursor = self.state.drag.get(&id).copied();
+        let active_cursor = if let Some(c) = dragging_cursor {
+            if self.cursors[c as usize].clicking {
+                Some(c as usize)
+            } else {
+                self.state.drag.remove(&id);
+                None
+            }
+        } else {
+            let mut found = None;
+            for i in 0..N_CURSORS {
+                if self.cursors[i].clicking {
+                    if let Some(p) = self.state.press_pos[i] {
+                        if grab.contains(p.0, p.1) && self.enabled {
+                            found = Some((i, p.0));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some((i, press_x)) = found {
+                self.state.drag.insert(id, i as u8);
+                let (x_l, x_h) = (x_of(*lo), x_of(*hi));
+                let handle = if (x_h - x_l).abs() < 1.0 { (press_x > x_l) as u8 }
+                             else if (press_x - x_l).abs() <= (press_x - x_h).abs() { 0 } else { 1 };
+                self.state.drag_handle.insert(id, handle);
+            }
+            found.map(|(i, _)| i)
+        };
+
+        if let Some(i) = active_cursor {
+            if let Some((cx, _cy)) = self.cursors[i].pos {
+                let frac = ((cx - track.x) / track.w.max(1.0)).clamp(0.0, 1.0);
+                let v = min + frac * (max - min);
+                if self.state.drag_handle.get(&id).copied().unwrap_or(0) == 0 {
+                    let new = v.min(max - gap).max(min);
+                    if (new - *lo).abs() > 1e-6 { *lo = new; changed = true; }
+                    if *hi < new + gap { *hi = new + gap; changed = true; }
+                } else {
+                    let new = v.max(min + gap).min(max);
+                    if (new - *hi).abs() > 1e-6 { *hi = new; changed = true; }
+                    if *lo > new - gap { *lo = new - gap; changed = true; }
+                }
+            }
+        }
+
+        // Track, the filled part between the thumbs, and two thumbs.
+        self.draw.rect(track, SLIDER_TRACK);
+        let (x_lo, x_hi) = (x_of(*lo), x_of(*hi));
+        self.draw.rect(Rect::new(x_lo, track.y, (x_hi - x_lo).max(0.0), track.h), SLIDER_FILL);
+        let lit = active_cursor.is_some() || self.hovered(grab);
+        let thumb_w = if lit { 16.0 } else { 12.0 };
+        for x in [x_lo, x_hi] {
+            self.draw.rect(Rect::new(x - thumb_w * 0.5, rect.y + 1.0, thumb_w, rect.h - 2.0), if lit { ACCENT } else { SLIDER_THUMB });
+        }
         changed
     }
 
@@ -684,7 +902,7 @@ impl Ui<'_> {
                 }
             } else {
                 let mut found = None;
-                for i in 0..2 {
+                for i in 0..N_CURSORS {
                     if self.cursors[i].clicking {
                         if let Some(p) = self.state.press_pos[i] {
                             if bar_rect.contains(p.0, p.1) {
@@ -736,4 +954,16 @@ fn sprite_uv(sprite: IconSprite) -> [f32; 4] {
         (sprite.x + sprite.w) / ICONS_SHEET_WIDTH,
         (sprite.y + sprite.h) / ICONS_SHEET_HEIGHT,
     ]
+}
+
+/// Colour of one heat-map cell: dull blue-grey when still, then blue, green, yellow and red as the strokes get faster.
+fn heat_color(v: u8) -> Color {
+    if v == 0 { return Color::rgba(0.16, 0.18, 0.25, 1.0); }
+    let t = v as f32 / 255.0;
+    let hue = 0.62 * (1.0 - t); // 0.62 is blue, 0 is red
+    let (s, val) = (0.85_f32, 0.95_f32);
+    let (h6, f) = ((hue * 6.0).floor(), hue * 6.0 - (hue * 6.0).floor());
+    let (p, q, u) = (val * (1.0 - s), val * (1.0 - s * f), val * (1.0 - s * (1.0 - f)));
+    let (r, g, b) = match h6 as i32 { 0 => (val, u, p), 1 => (q, val, p), 2 => (p, val, u), 3 => (p, q, val), _ => (u, p, val) };
+    Color::rgba(r, g, b, 1.0)
 }

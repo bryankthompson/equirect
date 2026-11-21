@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Runs the Handy bridge LIVE for the player (the Handy moves). Meant to run in its own minimized window, started by the launcher.
+# One at a time: if a live bridge already runs, this says so and exits. Output also goes to ~/.local/state/handy-sync/bridge.log.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The port is the real signal: a running bridge holds it (matching process text can hit any shell that mentions it).
+if ss -H -lun 'sport = :17777' | grep -q .; then
+  echo "handy-bridge: UDP port 17777 is already in use (a bridge is running), nothing to do"
+  sleep 3
+  exit 0
+fi
+log="$HOME/.local/state/handy-sync/bridge.log"
+mkdir -p "$(dirname "$log")"
+[ "$(stat -c %s "$log" 2>/dev/null || echo 0)" -gt 1000000 ] && : > "$log"
+echo "$(date -u +%H:%M:%SZ) handy-bridge: starting live" >> "$log"
+# -u: unbuffered, so the window and the log show status lines as they happen. Keys are read by the bridge, never printed.
+set +e
+python3 -I -u "$here/handy_sync.py" --live --keys "$HOME/.config/handy/keys.json" --port 17777 --bind 0.0.0.0 2>&1 | tee -a "$log"
+rc=${PIPESTATUS[0]}
+# It only ends on a startup problem or Ctrl-C: keep the window up so the reason can be read.
+echo "handy-bridge: stopped (exit $rc); this window closes in 60 s" | tee -a "$log"
+sleep 60

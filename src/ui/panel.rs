@@ -6,7 +6,7 @@ use crate::input::ControllerState;
 use super::assets::{PANEL_OFFSCREEN_FORMAT, UiAssets};
 use super::control_bar::{ControlBarActions, ControlBarState, draw};
 use super::draw_list::DrawList;
-use super::ui::{Ui, UiState, CursorInput, begin_frame, PANEL_BG};
+use super::ui::{Ui, UiState, CursorInput, N_CURSORS, begin_frame, PANEL_BG};
 
 /// Pixels scrolled per frame at full thumbstick deflection.
 const THUMBSTICK_SCROLL_SPEED: f32 = 40.0;
@@ -265,6 +265,19 @@ impl PanelRenderer {
         Some((u * self.pixel_width as f32, v * self.pixel_height as f32))
     }
 
+    /// Panel size in UI pixels.
+    pub fn pixel_size(&self) -> (f32, f32) {
+        (self.pixel_width as f32, self.pixel_height as f32)
+    }
+
+    /// A ray that hits panel pixel (`px`, `py`) head-on, for a pointer that has no
+    /// hand (the desktop mouse): it starts 1 m in front of the panel and points straight at it.
+    pub fn ray_through_pixel(&self, px: f32, py: f32) -> (Vec3, Vec3) {
+        let x = self.panel_center.x - self.panel_hw + px / self.pixel_width  as f32 * self.panel_hw * 2.0;
+        let y = self.panel_center.y + self.panel_hh - py / self.pixel_height as f32 * self.panel_hh * 2.0;
+        (Vec3::new(x, y, self.panel_center.z + 1.0), Vec3::NEG_Z)
+    }
+
     /// Ray hit point in world space, or `None` when the ray misses the quad.
     /// Used by the pointer renderer to truncate the beam.
     pub fn hit_test_3d(&self, ray_origin: Vec3, ray_dir: Vec3) -> Option<Vec3> {
@@ -291,12 +304,12 @@ impl PanelRenderer {
         device:      &wgpu::Device,
         queue:       &wgpu::Queue,
         assets:      &mut UiAssets,
-        controllers: &[Option<ControllerState>; 2],
+        controllers: &[Option<ControllerState>; N_CURSORS],
         draw_fn:     impl FnOnce(&mut Ui) -> R,
     ) -> R {
         // Build per-cursor input from each controller.
-        let mut cursors: [CursorInput; 2] = [CursorInput::default(), CursorInput::default()];
-        for i in 0..2 {
+        let mut cursors: [CursorInput; N_CURSORS] = [CursorInput::default(); N_CURSORS];
+        for i in 0..N_CURSORS {
             if let Some(ctrl) = &controllers[i] {
                 // Only compute a cursor position when the aim pose is being
                 // tracked; otherwise we'd hit-test against a zero ray and
@@ -313,10 +326,14 @@ impl PanelRenderer {
                 cursors[i] = CursorInput {
                     pos,
                     clicking: ctrl.clicking,
+                    is_mouse: ctrl.is_mouse,
                     scroll_y: -ctrl.thumbstick_y * THUMBSTICK_SCROLL_SPEED,
                 };
             }
         }
+
+        // Thumbnails that Windows has finished since the last frame go into their texture before anything draws them.
+        assets.thumbs.upload_ready(queue, &assets.thumb_texture);
 
         // Begin a UI frame.
         self.draw_list.clear();
@@ -329,6 +346,7 @@ impl PanelRenderer {
         );
         ui.paint_background(PANEL_BG);
         let result = draw_fn(&mut ui);
+        ui.draw_mouse_cursor();
         drop(ui);
 
         self.draw_list.finish();
@@ -344,6 +362,7 @@ impl PanelRenderer {
             &self.draw_list,
             assets.atlas.view(),
             &assets.icon_view,
+            &assets.thumb_view,
         );
 
         result
@@ -356,7 +375,7 @@ impl PanelRenderer {
         queue:       &wgpu::Queue,
         assets:      &mut UiAssets,
         state:       &ControlBarState,
-        controllers: &[Option<ControllerState>; 2],
+        controllers: &[Option<ControllerState>; N_CURSORS],
     ) -> ControlBarActions {
         self.update_ui(device, queue, assets, controllers, |ui| draw(ui, state))
     }

@@ -57,6 +57,7 @@ pub enum QuadKind {
     Solid  = 0,
     Glyph  = 1,
     Sprite = 2,
+    Thumb  = 3,
 }
 
 #[repr(C)]
@@ -157,6 +158,17 @@ impl DrawList {
     pub fn sprite(&mut self, screen: Rect, uv: [f32; 4], tint: Color) {
         if tint.a <= 0.0 || screen.w <= 0.0 || screen.h <= 0.0 { return; }
         self.push_quad(screen, uv, tint, QuadKind::Sprite);
+    }
+
+    /// A picture from the thumbnail texture (`crate::thumbs`).
+    pub fn thumb(&mut self, screen: Rect, uv: [f32; 4], tint: Color) {
+        if tint.a <= 0.0 || screen.w <= 0.0 || screen.h <= 0.0 { return; }
+        self.push_quad(screen, uv, tint, QuadKind::Thumb);
+    }
+
+    /// The clip rectangle now in force (the scroll area's viewport, say), or None when nothing clips.
+    pub fn current_clip(&self) -> Option<Rect> {
+        self.clip_stack.last().copied()
     }
 
     // ── internals ──────────────────────────────────────────────────────────

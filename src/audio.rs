@@ -197,7 +197,18 @@ impl AudioPlayer {
         current_pts_us: Arc<AtomicU64>,
     ) -> Option<Self> {
         let host   = cpal::default_host();
-        let device = host.default_output_device()?;
+        // Play on the headset's own audio device (name contains "vive" by default), not the
+        // Windows default output. EQUIRECT_AUDIO_DEVICE=<part of a device name> overrides it.
+        let want = std::env::var("EQUIRECT_AUDIO_DEVICE")
+            .unwrap_or_else(|_| "vive".into())
+            .to_lowercase();
+        let device = host
+            .output_devices()
+            .ok()
+            .and_then(|mut devs| {
+                devs.find(|d| d.name().map_or(false, |n| n.to_lowercase().contains(&want)))
+            })
+            .or_else(|| host.default_output_device())?;
         let device_name = device.name().unwrap_or_else(|_| "unknown".into());
 
         // Use the device's preferred sample rate.  If the file rate differs,
@@ -314,6 +325,12 @@ impl AudioPlayer {
                         let speed = SPEEDS[idx.min(SPEEDS.len() - 1)]
                             * (file_sr as f32 / device_sr as f32);
                         ola.fill(data, &rx, speed);
+                    }
+
+                    // ── volume (the slider and the mute button) ───────────────
+                    let gain = crate::volume::current_gain();
+                    if gain != 1.0 {
+                        for s in data.iter_mut() { *s *= gain; }
                     }
 
                     // ── A/V sync logging (verbose, every 5 s) ────────────────

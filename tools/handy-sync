@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+entry="${BASH_SOURCE[0]}"
+while [ -L "$entry" ]; do
+  target="$(readlink "$entry")"
+  case "$target" in
+    /*) entry="$target" ;;
+    *) entry="$(dirname -- "$entry")/$target" ;;
+  esac
+done
+here="$(cd -- "$(dirname -- "$entry")" && pwd)"
+exec python3 -I "$here/handy_sync.py" "$@"

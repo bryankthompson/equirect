@@ -2,6 +2,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use wgpu::util::DeviceExt;
 
+use crate::screen::Screen;
 use crate::ui::settings::{Projection, StereoLayout, VideoMode, VideoSettings};
 use crate::video::texture::VideoTexture;
 
@@ -75,23 +76,52 @@ struct Vertex {
     uv: [f32; 2],
 }
 
-fn build_quad(aspect: f32) -> [Vertex; 6] {
-    // A flat quad 3.2 m wide, 2.5 m in front of the origin.
-    // Y-up, -Z forward (OpenXR stage space).
-    // Centered at eye level: cy = hh so that the vertical midpoint sits at
-    // approximately standing eye height above the stage floor.
-    let hw = 1.6_f32;
-    let hh = hw / aspect;
-    let cy = hh;      // shift up so center is at eye level
-    let z  = -2.5_f32;
-    [
-        Vertex { position: [-hw, cy + hh, z], uv: [0.0, 0.0] },
-        Vertex { position: [-hw, cy - hh, z], uv: [0.0, 1.0] },
-        Vertex { position: [ hw, cy + hh, z], uv: [1.0, 0.0] },
-        Vertex { position: [ hw, cy + hh, z], uv: [1.0, 0.0] },
-        Vertex { position: [-hw, cy - hh, z], uv: [0.0, 1.0] },
-        Vertex { position: [ hw, cy - hh, z], uv: [1.0, 1.0] },
-    ]
+/// Strips the curved screen is cut into (a flat screen is one).
+const SEGMENTS: usize = 64;
+
+/// The screen: 3.2 m wide (times zoom) and 2.5 m in front of the viewer by default, where the SteamVR quad layer used to
+/// hang. Portrait video is capped at the height of a 16:9 screen. Drawn in the scene (not as an overlay) so the control
+/// panels always stay in front of it.
+///
+/// `curved` (Curved mode) bends it onto a cylinder of radius distance / curve, its middle staying put; 100% puts the axis at
+/// the viewer. The tilt then turns the whole screen about the viewer's eyes (at `height`), so a screen tilted up still
+/// faces the viewer. Triangles come in the order the old flat quad used: top-left, bottom-left, top-right, then the rest.
+fn build_screen(aspect: f32, zoom: f32, curved: bool, screen: &Screen) -> Vec<Vertex> {
+    let mut w = 3.2_f32;
+    let mut h = w / aspect.max(0.01);
+    if h > 1.8 {
+        let s = 1.8 / h;
+        w *= s;
+        h = 1.8;
+    }
+    let (w, h) = (w * zoom, h * zoom);
+    let d = screen.distance;
+    let c = if curved { screen.curve as f32 / 100.0 } else { 0.0 };
+    let bent = c > 0.001;
+    let (sin_t, cos_t) = screen.tilt.to_radians().sin_cos();
+    // A point `u` metres across and `y` up from the middle of the screen, in the scene.
+    let place = |u: f32, y: f32| -> [f32; 3] {
+        let (x, z) = if bent {
+            let r = d / c;
+            let a = u / r;
+            (r * a.sin(), -d + r * (1.0 - a.cos()))
+        } else {
+            (u, -d)
+        };
+        [x, screen.height + y * cos_t - z * sin_t, y * sin_t + z * cos_t]
+    };
+    let n = if bent { SEGMENTS } else { 1 };
+    let mut v = Vec::with_capacity(n * 6);
+    for i in 0..n {
+        let (t0, t1) = (i as f32 / n as f32, (i + 1) as f32 / n as f32);
+        let (u0, u1) = ((t0 - 0.5) * w, (t1 - 0.5) * w);
+        let tl = Vertex { position: place(u0,  h * 0.5), uv: [t0, 0.0] };
+        let bl = Vertex { position: place(u0, -h * 0.5), uv: [t0, 1.0] };
+        let tr = Vertex { position: place(u1,  h * 0.5), uv: [t1, 0.0] };
+        let br = Vertex { position: place(u1, -h * 0.5), uv: [t1, 1.0] };
+        v.extend([tl, bl, tr, tr, bl, br]);
+    }
+    v
 }
 
 // ── VideoRenderer ──────────────────────────────────────────────────────────
@@ -104,6 +134,8 @@ pub struct VideoRenderer {
     texture_bgl:        wgpu::BindGroupLayout,
     sampler:            wgpu::Sampler,
     vertex_buffer:      wgpu::Buffer,
+    /// Width / height of the whole video frame (both eyes for side-by-side).
+    aspect:             f32,
     texture_bind_group: Option<wgpu::BindGroup>,
     params_buffer:      wgpu::Buffer,
     params_bind_group:  wgpu::BindGroup,
@@ -301,11 +333,12 @@ impl VideoRenderer {
 
         // ── quad vertex buffer ────────────────────────────────────────────
         let aspect = video_width as f32 / video_height.max(1) as f32;
-        let verts = build_quad(aspect);
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Room for the most triangles a screen has (a curved one); `render_eye` fills it before every draw.
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("video_quad_vbuf"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
+            size: (SEGMENTS * 6 * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         Self {
@@ -316,6 +349,7 @@ impl VideoRenderer {
             texture_bgl,
             sampler,
             vertex_buffer,
+            aspect,
             texture_bind_group: None,
             params_buffer,
             params_bind_group,
@@ -375,6 +409,19 @@ impl VideoRenderer {
         let params = VideoParams::from_settings(settings, eye, self.pixel_fmt);
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
 
+        // The screen: size follows the zoom and the per-eye aspect (half of a side-by-side frame); only Curved mode bends.
+        let mut screen_vertices = 0;
+        if !use_direction_shader {
+            let eye_aspect = match settings.stereo {
+                StereoLayout::LR | StereoLayout::RL => self.aspect * 0.5,
+                StereoLayout::TB | StereoLayout::BT => self.aspect * 2.0,
+                StereoLayout::OneView => self.aspect,
+            };
+            let verts = build_screen(eye_aspect, settings.zoom.max(0.1), settings.mode == VideoMode::Curved2D, &settings.screen);
+            queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&verts));
+            screen_vertices = verts.len() as u32;
+        }
+
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -404,7 +451,7 @@ impl VideoRenderer {
             } else {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.draw(0..6, 0..1);
+                pass.draw(0..screen_vertices, 0..1);
             }
         }
 
@@ -414,3 +461,85 @@ impl VideoRenderer {
             .ok();
     }
 }
+
+#[cfg(test)]
+mod screen_geometry_tests {
+    use super::*;
+
+    const WIDE: f32 = 16.0 / 9.0;
+
+    fn corners(v: &[Vertex]) -> Vec<[f32; 3]> { v.iter().map(|x| x.position).collect() }
+
+    fn close(a: f32, b: f32) -> bool { (a - b).abs() < 1e-3 }
+
+    #[test]
+    fn the_default_flat_screen_hangs_where_it_always_did() {
+        let v = build_screen(WIDE, 1.0, false, &Screen::default());
+        assert_eq!(v.len(), 6);
+        let p = corners(&v);
+        let same = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| close(*x, y));
+        assert!(same(p[0], [-1.6, 1.9, -2.5]), "top left {:?}", p[0]);
+        assert!(same(p[1], [-1.6, 0.1, -2.5]), "bottom left {:?}", p[1]);
+        assert!(same(p[2], [ 1.6, 1.9, -2.5]), "top right {:?}", p[2]);
+        assert_eq!(v[0].uv, [0.0, 0.0]);
+        assert_eq!(v[5].uv, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn only_curved_mode_bends_and_zoom_scales() {
+        let flat = build_screen(WIDE, 1.0, false, &Screen { curve: 100, ..Screen::default() });
+        assert_eq!(flat.len(), 6, "the curve value means nothing for a flat screen");
+        let curved = build_screen(WIDE, 1.0, true, &Screen { curve: 0, ..Screen::default() });
+        assert_eq!(curved.len(), 6, "0% curve is flat");
+        let big = build_screen(WIDE, 2.0, false, &Screen::default());
+        assert!(close(big[2].position[0], 3.2));
+    }
+
+    #[test]
+    fn a_full_curve_wraps_the_screen_around_the_viewer() {
+        let s = Screen { curve: 100, ..Screen::default() };
+        let v = build_screen(WIDE, 1.0, true, &s);
+        assert_eq!(v.len(), SEGMENTS * 6);
+        for p in corners(&v) {
+            assert!(close((p[0] * p[0] + p[2] * p[2]).sqrt(), 2.5), "{p:?} is not 2.5 m from the viewer's axis");
+        }
+        // the middle stays where the flat screen's middle is, the edges come toward the viewer
+        let edge = v[0].position;
+        assert!(edge[2] > -2.5 + 0.1 && edge[0] < -1.0, "{edge:?}");
+        // the width along the curve is still 3.2 m (the strips are short chords, so a hair less)
+        let across: f32 = (0..SEGMENTS).map(|i| {
+            let (a, b) = (v[i * 6].position, v[i * 6 + 2].position);
+            ((a[0] - b[0]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        }).sum();
+        assert!((across - 3.2).abs() < 0.01, "{across}");
+    }
+
+    #[test]
+    fn a_half_curve_has_twice_the_radius() {
+        let s = Screen { curve: 50, ..Screen::default() };
+        for p in corners(&build_screen(WIDE, 1.0, true, &s)) {
+            // radius 5 m, its axis 2.5 m behind the viewer
+            assert!(close((p[0] * p[0] + (p[2] - 2.5) * (p[2] - 2.5)).sqrt(), 5.0), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn height_lifts_and_tilt_turns_the_screen_about_the_viewer() {
+        let up = Screen { height: 1.5, ..Screen::default() };
+        assert!(close(build_screen(WIDE, 1.0, false, &up)[0].position[1], 2.4));
+        // tilted straight up (lying on the back): the screen's middle is d above the viewer's eyes
+        let overhead = Screen { tilt: 90.0, ..Screen::default() };
+        let p = corners(&build_screen(WIDE, 1.0, false, &overhead));
+        let mid = [p[0], p[1], p[2], p[5]].iter().fold([0.0; 3], |m, q| [m[0] + q[0] / 4.0, m[1] + q[1] / 4.0, m[2] + q[2] / 4.0]);
+        assert!(close(mid[0], 0.0) && close(mid[1], 1.0 + 2.5) && close(mid[2], 0.0), "{mid:?}");
+        // and a small tilt keeps the distance from the eyes
+        let tilted = Screen { tilt: -20.0, ..Screen::default() };
+        let v = build_screen(WIDE, 1.0, false, &tilted);
+        let (a, b) = (v[0].position, v[1].position);
+        let mid_y = (a[1] + b[1]) / 2.0 - 1.0;
+        let mid_z = (a[2] + b[2]) / 2.0;
+        assert!(close((mid_y * mid_y + mid_z * mid_z).sqrt(), 2.5), "{a:?} {b:?}");
+        assert!(mid_y < 0.0, "a negative tilt turns the screen down");
+    }
+}
+
