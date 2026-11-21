@@ -69,8 +69,10 @@ const PI: f32 = 3.14159265358979323846;
 fn world_dir(clip_xy: vec2f) -> vec3f {
     let P = camera.projection;
     let raw = vec3f(
-        clip_xy.x / P[0][0] * params.inv_zoom,
-        clip_xy.y / P[1][1] * params.inv_zoom,
+        // P[2][0] / P[2][1] are the off-axis terms of an asymmetric per-eye FOV (Vive Pro 2,
+        // Index, Pimax...). Leaving them out shifts each eye differently, so the eyes do not fuse.
+        (clip_xy.x + P[2][0]) / P[0][0] * params.inv_zoom,
+        (clip_xy.y + P[2][1]) / P[1][1] * params.inv_zoom,
         -1.0,
     );
     let R_inv = transpose(mat3x3f(

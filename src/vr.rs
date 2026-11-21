@@ -2,13 +2,15 @@ use std::ffi::CStr;
 use openxr as xr;
 use crate::vprintln;
 
+use crate::desk_input::DeskInput;
 use crate::input::{ControllerState, XrInput};
 use crate::pointer_renderer::PointerRenderer;
 use crate::renderer::Renderer;
 use crate::ui::browser::{BrowserActions, BrowserState, draw as browser_draw};
 use crate::ui::control_bar::{ControlBarActions, ControlBarState};
 use crate::ui::panel::PanelRenderer;
-use crate::ui::settings::{SettingsActions, VideoSettings, draw as settings_draw};
+use crate::ui::ui::N_CURSORS;
+use crate::ui::settings::{SettingsActions, SettingsView, VideoSettings, draw as settings_draw};
 use crate::video::texture::VideoTexture;
 use crate::video_layer::{
     VideoSwapchain, EffectiveLayerMode, effective_mode,
@@ -66,6 +68,19 @@ fn yaw_quat_from_head(pose: &xr::Posef) -> glam::Quat {
     glam::Quat::from_rotation_y(-yaw)
 }
 
+/// Did the SteamVR centre (the origin of the LOCAL space, seen from the stage) move since last frame?
+/// Only a real re-centre moves it that far: a hand's width, or a few degrees of turn.
+fn centre_moved(before: (glam::Vec3, glam::Quat), now: (glam::Vec3, glam::Quat)) -> bool {
+    before.0.distance(now.0) > 0.02 || before.1.angle_between(now.1) > 2.0_f32.to_radians()
+}
+
+/// The scene's frame for a head: (orientation, origin). The origin is the spot on the floor under the head;
+/// the orientation faces where the head looks, upright or (with `keep_pitch`) locked to the full head direction.
+fn scene_frame(head: &xr::Posef, keep_pitch: bool) -> (glam::Quat, glam::Vec3) {
+    let orient = if keep_pitch { full_quat_from_head(head) } else { yaw_quat_from_head(head) };
+    (orient, glam::Vec3::new(head.position.x, 0.0, head.position.z))
+}
+
 /// Extract the full head orientation from an XR head pose as a glam quaternion.
 fn full_quat_from_head(pose: &xr::Posef) -> glam::Quat {
     let q = pose.orientation;
@@ -74,14 +89,14 @@ fn full_quat_from_head(pose: &xr::Posef) -> glam::Quat {
 
 /// Build an XR pose for a video layer given a base orientation.
 /// Position is placed `dist` metres ahead along the horizontal forward of `orient`
-/// at `height` metres above the stage floor; the layer orientation is `orient` itself.
-fn oriented_pose(dist: f32, height: f32, orient: glam::Quat) -> xr::Posef {
+/// at `height` metres above the stage floor, all of it moved by `origin`; the layer orientation is `orient` itself.
+fn oriented_pose(dist: f32, height: f32, orient: glam::Quat, origin: glam::Vec3) -> xr::Posef {
     // Use only the horizontal component of the forward vector for positioning so
     // that looking up/down doesn't float the quad above or below eye level.
     let fwd = orient * glam::Vec3::NEG_Z;
     let horiz = glam::Vec2::new(fwd.x, fwd.z).normalize_or(glam::Vec2::new(0.0, -1.0));
     xr::Posef {
-        position: xr::Vector3f { x: horiz.x * dist, y: height, z: horiz.y * dist },
+        position: xr::Vector3f { x: origin.x + horiz.x * dist, y: origin.y + height, z: origin.z + horiz.y * dist },
         orientation: xr::Quaternionf { x: orient.x, y: orient.y, z: orient.z, w: orient.w },
     }
 }
@@ -227,7 +242,10 @@ impl VrPreInit {
             system,
             has_legacy_vulkan: exts.khr_vulkan_enable,
             has_cylinder:  exts.khr_composition_layer_cylinder,
-            has_equirect2: exts.khr_composition_layer_equirect2,
+            // 180/360 video is drawn by our own shader sphere by default. Set EQUIRECT_USE_LAYER=1
+            // to let SteamVR draw it as an equirect2 layer (hurt the eyes on the Vive Pro 2 in testing).
+            has_equirect2: exts.khr_composition_layer_equirect2
+                && std::env::var_os("EQUIRECT_USE_LAYER").is_some(),
         })
     }
 
@@ -267,6 +285,11 @@ pub struct VrContext {
     frame_stream: std::mem::ManuallyDrop<xr::FrameStream<xr::Vulkan>>,
     frame_waiter: std::mem::ManuallyDrop<xr::FrameWaiter>,
     stage: std::mem::ManuallyDrop<xr::Space>,
+    /// SteamVR's own centre ("Reset seated position" moves it). We draw in the stage, which that does not move,
+    /// so we watch where this space sits in the stage and follow it. None if the runtime has no LOCAL space.
+    local: Option<xr::Space>,
+    /// Where `local` sat in the stage last frame (position, orientation).
+    local_centre: Option<(glam::Vec3, glam::Quat)>,
     pub eyes: [std::mem::ManuallyDrop<EyeSwapchain>; 2],
     session: std::mem::ManuallyDrop<xr::Session<xr::Vulkan>>,
     instance: std::mem::ManuallyDrop<xr::Instance>,
@@ -281,6 +304,10 @@ pub struct VrContext {
     pub should_quit: bool,
     frame_count: u64,
     prev_menu_pressed: bool,
+    prev_click: [bool; N_CURSORS],
+    /// Desktop mouse and keyboard, on top of the controllers.
+    desk: DeskInput,
+    prev_both_grips: bool,
     prev_grip_pressed: bool,
     last_seek_time: Option<std::time::Instant>,
     /// Base orientation applied to all video layers.
@@ -289,7 +316,12 @@ pub struct VrContext {
     /// After a grip press it is the full head orientation so the video is
     /// locked exactly to where the user was pointing.
     base_orientation: glam::Quat,
+    /// Where the scene's middle is on the stage floor: the spot under the head when the scene was last centred.
+    /// Panels, screen and pointer rays all live in the frame turned by `base_orientation` and moved here.
+    base_origin: glam::Vec3,
     orientation_initialized: bool,
+    /// The settings screen's Center button was pressed: centre on the next frame.
+    center_asked: bool,
     // Input — NOT ManuallyDrop; dropped explicitly in Drop before the session.
     xr_input: Option<XrInput>,
 }
@@ -322,6 +354,9 @@ impl Drop for VrContext {
 
             let stage = std::mem::ManuallyDrop::take(&mut self.stage);
             std::mem::forget(stage); // do NOT call xrDestroySpace
+            if let Some(local) = self.local.take() {
+                std::mem::forget(local);
+            }
 
             // xrDestroySession releases everything; xrDestroyInstance last.
             std::mem::ManuallyDrop::drop(&mut self.session);
@@ -380,6 +415,15 @@ impl VrContext {
             .map_err(|e| eprintln!("XR: graphics_requirements failed: {e}"))
             .ok()?;
 
+        // SteamVR refuses xrCreateSession unless xrGetVulkanGraphicsDevice was called first
+        // ("failed to call xrGetVulkanGraphicsDevice before xrCreateSession").
+        let xr_physical = unsafe { xr_instance.vulkan_graphics_device(system, vk_instance) }
+            .map_err(|e| eprintln!("XR: vulkan_graphics_device failed: {e}"))
+            .ok()?;
+        if xr_physical != vk_physical {
+            eprintln!("XR: warning: the runtime wants a different GPU than the renderer picked");
+        }
+
         // ── create XR session ────────────────────────────────────────────────
         let (session, frame_waiter, frame_stream) = unsafe {
             xr_instance
@@ -403,6 +447,11 @@ impl VrContext {
             .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
             .map_err(|e| eprintln!("XR: create_reference_space failed: {e}"))
             .ok()?;
+
+        let local = session
+            .create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
+            .map_err(|e| eprintln!("XR: no LOCAL space, SteamVR's centre will not be followed: {e}"))
+            .ok();
 
         let view_type = xr::ViewConfigurationType::PRIMARY_STEREO;
         let view_cfgs = xr_instance
@@ -499,6 +548,8 @@ impl VrContext {
             frame_waiter: std::mem::ManuallyDrop::new(frame_waiter),
             frame_stream: std::mem::ManuallyDrop::new(frame_stream),
             stage: std::mem::ManuallyDrop::new(stage),
+            local,
+            local_centre: None,
             eyes: [
                 std::mem::ManuallyDrop::new(eye0),
                 std::mem::ManuallyDrop::new(eye1),
@@ -513,10 +564,15 @@ impl VrContext {
             should_quit: false,
             frame_count: 0,
             prev_menu_pressed: false,
+            prev_click: [false; N_CURSORS],
+            desk: DeskInput::new(true),
+            prev_both_grips: false,
             prev_grip_pressed: false,
             last_seek_time: None,
             base_orientation: glam::Quat::IDENTITY,
+            base_origin: glam::Vec3::ZERO,
             orientation_initialized: false,
+            center_asked: false,
             xr_input,
         })
     }
@@ -544,6 +600,17 @@ impl VrContext {
         if let Err(e) = self.session.request_exit() {
             eprintln!("XR: request_exit failed (may be OK if session not running): {e}");
         }
+    }
+
+    /// Put the scene's middle under `head` and turn it to face where the head looks: upright (yaw only) or, with
+    /// `keep_pitch`, locked to the full head direction. Heights stay as they were (the Screen page sets those).
+    fn center_scene(&mut self, head: &xr::Posef, keep_pitch: bool) {
+        (self.base_orientation, self.base_origin) = scene_frame(head, keep_pitch);
+    }
+
+    /// The scene's frame (where the panels and the screen live) as a matrix into the stage.
+    fn scene_to_stage(&self) -> glam::Mat4 {
+        glam::Mat4::from_translation(self.base_origin) * glam::Mat4::from_quat(self.base_orientation)
     }
 
     pub fn poll_events(&mut self) -> bool {
@@ -574,6 +641,14 @@ impl VrContext {
                 InstanceLossPending(_) => {
                     self.should_quit = true;
                 }
+                // SteamVR's "reset seated position" lands here. Only logged: the frame loop follows the
+                // centre by watching the LOCAL space, and this line shows which space the runtime moved.
+                ReferenceSpaceChangePending(e) => {
+                    crate::diag::log(&format!(
+                        "xr: reference space change pending: {:?}, pose valid {}",
+                        e.reference_space_type(), e.pose_valid(),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -590,7 +665,7 @@ impl VrContext {
         video_shader:     Option<(&VideoRenderer, &VideoTexture, &VideoSettings)>,
         mut panel:        Option<(&mut PanelRenderer, &ControlBarState)>,
         mut browser:      Option<(&mut PanelRenderer, &mut BrowserState)>,
-        mut settings:     Option<(&mut PanelRenderer, &mut VideoSettings)>,
+        mut settings:     Option<(&mut PanelRenderer, SettingsView<'_>)>,
         pointer_renderer: Option<&PointerRenderer>,
     ) -> (ControlBarActions, BrowserActions, SettingsActions) {
         if !self.poll_events() {
@@ -644,12 +719,39 @@ impl VrContext {
             }
         };
 
-        // On the first rendered frame: capture yaw only so the video faces the user
+        // On the first rendered frame: centre on the head, yaw only, so the video faces the user
         // regardless of any pitch the headset had while being put on.
+        let head = views[0].pose;
         if !self.orientation_initialized {
-            self.base_orientation = yaw_quat_from_head(&views[0].pose);
+            self.center_scene(&head, false);
             self.orientation_initialized = true;
             vprintln!("XR: base orientation initialised (yaw-only)");
+        }
+
+        // SteamVR's centre moved (the user reset the seated position): follow it, so "centre" in SteamVR
+        // works here too. The head now sits at SteamVR's new origin, so centring on it is the same thing.
+        if let Some(local) = &self.local {
+            match local.locate(&self.stage, frame_state.predicted_display_time) {
+                Ok(loc) if loc.location_flags.contains(
+                    xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID,
+                ) => {
+                    let (p, o) = (loc.pose.position, loc.pose.orientation);
+                    let now = (glam::Vec3::new(p.x, p.y, p.z), glam::Quat::from_xyzw(o.x, o.y, o.z, o.w));
+                    if let Some(before) = self.local_centre {
+                        if centre_moved(before, now) {
+                            crate::diag::log("xr: SteamVR centre moved: centring the scene on the head");
+                            self.center_scene(&head, false);
+                        }
+                    }
+                    self.local_centre = Some(now);
+                }
+                _ => {}
+            }
+        }
+        // The settings screen's Center button.
+        if std::mem::take(&mut self.center_asked) {
+            self.center_scene(&head, false);
+            crate::diag::log("xr: centred on the head (Center button)");
         }
 
         // Edge-detect grip press — either controller resets the base orientation
@@ -658,8 +760,8 @@ impl VrContext {
         let grip_just_pressed = any_grip_now && !self.prev_grip_pressed;
         self.prev_grip_pressed = any_grip_now;
         if grip_just_pressed {
-            self.base_orientation = full_quat_from_head(&views[0].pose);
-            vprintln!("XR: base orientation reset (full)");
+            self.center_scene(&head, true);
+            vprintln!("XR: scene centred (full orientation)");
         }
 
         // Edge-detect B/Y menu button across both controllers.
@@ -678,17 +780,27 @@ impl VrContext {
         // Panels live at (0, y, -2) in local space; base_orientation rotates that frame
         // into stage space.  Hit-testing and UI input both need local-frame rays.
         let inv_orient = self.base_orientation.inverse();
-        let oriented_controllers: [Option<ControllerState>; 2] = [
+        let origin = self.base_origin;
+        // Desktop mouse: a third pointer aimed straight at whichever panel is showing
+        // (already in the panel frame, so it skips the orientation above).
+        let mouse: Option<ControllerState> = {
+            let active: Option<&PanelRenderer> = panel.as_ref().map(|(p, _)| &**p)
+                .or_else(|| browser.as_ref().map(|(p, _)| &**p))
+                .or_else(|| settings.as_ref().map(|(p, _)| &**p));
+            active.and_then(|p| self.desk.pointer(p))
+        };
+        let oriented_controllers: [Option<ControllerState>; N_CURSORS] = [
             controllers[0].map(|c| ControllerState {
-                ray_origin: inv_orient * c.ray_origin,
+                ray_origin: inv_orient * (c.ray_origin - origin),
                 ray_dir:    inv_orient * c.ray_dir,
                 ..c
             }),
             controllers[1].map(|c| ControllerState {
-                ray_origin: inv_orient * c.ray_origin,
+                ray_origin: inv_orient * (c.ray_origin - origin),
                 ray_dir:    inv_orient * c.ray_dir,
                 ..c
             }),
+            mouse,
         ];
 
         // Update the control-bar panel UI texture once (shared by both eyes).
@@ -696,7 +808,36 @@ impl VrContext {
             Some((p, s)) => p.update(&renderer.device, &renderer.queue, ui_assets, s, &oriented_controllers),
             None => ControlBarActions::default(),
         };
-        cb_actions.menu_toggle = menu_just_pressed;
+        // Trigger pull (DeoVR style): pops the controls up when everything is hidden, and
+        // hides them when the pull is aimed away from the control bar.
+        let click_now: [bool; N_CURSORS] = [
+            controllers[0].map_or(false, |c| c.clicking),
+            controllers[1].map_or(false, |c| c.clicking),
+            mouse.map_or(false, |m| m.clicking),
+        ];
+        // A mouse click while everything is hidden brings the control bar back
+        // (no panel is showing then, so the mouse has no pointer to click with).
+        let mouse_click = self.desk.take_click();
+        let all_hidden = panel.is_none() && browser.is_none() && settings.is_none();
+        let mut trigger_toggle = all_hidden && mouse_click;
+        for i in 0..N_CURSORS {
+            if click_now[i] && !self.prev_click[i] {
+                if all_hidden {
+                    trigger_toggle = true;
+                } else if let (Some((p, _)), Some(oc)) = (&panel, &oriented_controllers[i]) {
+                    if p.hit_test_3d(oc.ray_origin, oc.ray_dir).is_none() {
+                        trigger_toggle = true;
+                    }
+                }
+            }
+        }
+        self.prev_click = click_now;
+        cb_actions.menu_toggle = menu_just_pressed || trigger_toggle;
+        // Both grips squeezed together = reset the video settings to the detected ones.
+        let both_grips = controllers[0].map_or(false, |c| c.grip_pressed)
+            && controllers[1].map_or(false, |c| c.grip_pressed);
+        cb_actions.reset_settings = both_grips && !self.prev_both_grips;
+        self.prev_both_grips = both_grips;
 
         // Emit a seek delta when the thumbstick X is past the dead zone and
         // at least 100 ms have elapsed since the last seek emission.
@@ -716,6 +857,8 @@ impl VrContext {
             // deflection fires immediately rather than waiting out the interval.
             self.last_seek_time = None;
         }
+        // Keyboard shortcuts last, so a held arrow key is not overwritten by the thumbstick seek.
+        self.desk.apply_keys(&mut cb_actions);
 
         // Update the browser panel UI texture once (shared by both eyes).
         let browser_actions = match &mut browser {
@@ -740,7 +883,7 @@ impl VrContext {
         // so the pointer beam (rendered with stage-space view_mat) lines up correctly.
         let pointer_hits: [Option<glam::Vec3>; 2] = {
             let mut h = [None, None];
-            for (i, oc) in oriented_controllers.iter().enumerate() {
+            for (i, oc) in oriented_controllers.iter().take(2).enumerate() {
                 if let Some(oc) = oc {
                     let local_hit = panel.as_ref()
                         .and_then(|(p, _)| p.hit_test_3d(oc.ray_origin, oc.ray_dir))
@@ -749,7 +892,7 @@ impl VrContext {
                         .or_else(|| settings.as_ref()
                             .and_then(|(p, _)| p.hit_test_3d(oc.ray_origin, oc.ray_dir)));
                     // Rotate hit back to stage space for the pointer renderer.
-                    h[i] = local_hit.map(|hp| self.base_orientation * hp);
+                    h[i] = local_hit.map(|hp| self.base_orientation * hp + self.base_origin);
                 }
             }
             h
@@ -774,7 +917,7 @@ impl VrContext {
             if let Some((vr_rend, _, vs)) = video_shader {
                 // Pre-rotate the view by base_orientation so the video's forward axis
                 // (-Z in video space) maps to the user's captured direction in stage space.
-                let view_oriented = view_mat * glam::Mat4::from_quat(self.base_orientation);
+                let view_oriented = view_mat * self.scene_to_stage();
                 vr_rend.render_eye(&tex_view, proj, view_oriented, vs, eye, &renderer.device, &renderer.queue);
             } else {
                 // Clear to transparent so the video composition layer shows through.
@@ -784,7 +927,7 @@ impl VrContext {
             // Panels live in the "oriented" local frame.  Pre-multiply view by the base
             // orientation so that a panel at local (0, y, -2) appears in front of the
             // user's initial (or grip-reset) facing direction in stage space.
-            let view_oriented = view_mat * glam::Mat4::from_quat(self.base_orientation);
+            let view_oriented = view_mat * self.scene_to_stage();
             if let Some((p, _)) = &panel {
                 p.render_eye(&tex_view, proj, view_oriented, &renderer.device, &renderer.queue);
             }
@@ -889,7 +1032,7 @@ impl VrContext {
                             .space(stage)
                             .eye_visibility(eye_vis)
                             .sub_image(sub)
-                            .pose(oriented_pose(2.5, 1.0, self.base_orientation))
+                            .pose(oriented_pose(2.5, 1.0, self.base_orientation, self.base_origin))
                             .size(xr::Extent2Df {
                                 width:  w * zoom,
                                 height: h * zoom,
@@ -902,7 +1045,7 @@ impl VrContext {
                             .space(stage)
                             .eye_visibility(eye_vis)
                             .sub_image(sub)
-                            .pose(oriented_pose(0.0, 1.0, self.base_orientation))
+                            .pose(oriented_pose(0.0, 1.0, self.base_orientation, self.base_origin))
                             .radius(radius)
                             .central_angle(central_angle)
                             .aspect_ratio(disp_aspect);
@@ -916,7 +1059,7 @@ impl VrContext {
                             .space(stage)
                             .eye_visibility(eye_vis)
                             .sub_image(sub)
-                            .pose(oriented_pose(0.0, 0.0, self.base_orientation))
+                            .pose(oriented_pose(0.0, 0.0, self.base_orientation, self.base_origin))
                             .radius(0.0)
                             .central_horizontal_angle(ch)
                             .upper_vertical_angle(vu)
@@ -931,7 +1074,7 @@ impl VrContext {
                             .space(stage)
                             .eye_visibility(eye_vis)
                             .sub_image(sub)
-                            .pose(oriented_pose(0.0, 0.0, self.base_orientation))
+                            .pose(oriented_pose(0.0, 0.0, self.base_orientation, self.base_origin))
                             .radius(0.0)
                             .central_horizontal_angle(ch)
                             .upper_vertical_angle(vu)
@@ -970,6 +1113,15 @@ impl crate::mode::Mode for VrContext {
     fn should_quit(&self) -> bool { self.should_quit }
     fn request_exit(&self) { VrContext::request_exit(self); }
 
+    fn handle_window_event(&mut self, event: &winit::event::WindowEvent) {
+        self.desk.handle_window_event(event);
+    }
+    fn handle_device_event(&mut self, event: &winit::event::DeviceEvent) {
+        self.desk.handle_device_event(event);
+    }
+    fn set_mouse_active(&mut self, on: bool) { self.desk.set_active(on); }
+    fn center(&mut self) { self.center_asked = true; }
+
     fn create_video_swapchain(
         &self,
         device: &wgpu::Device,
@@ -987,11 +1139,55 @@ impl crate::mode::Mode for VrContext {
         video_shader:     Option<(&VideoRenderer, &VideoTexture, &VideoSettings)>,
         panel:            Option<(&mut PanelRenderer, &ControlBarState)>,
         browser:          Option<(&mut PanelRenderer, &mut BrowserState)>,
-        settings:         Option<(&mut PanelRenderer, &mut VideoSettings)>,
+        settings:         Option<(&mut PanelRenderer, SettingsView<'_>)>,
         pointer_renderer: Option<&PointerRenderer>,
     ) -> (ControlBarActions, BrowserActions, SettingsActions) {
         VrContext::render_frame(
             self, renderer, ui_assets, video_layer, video_shader, panel, browser, settings, pointer_renderer,
         )
+    }
+}
+
+#[cfg(test)]
+mod centre_tests {
+    use super::*;
+
+    fn head(x: f32, y: f32, z: f32, yaw_deg: f32, pitch_deg: f32) -> xr::Posef {
+        let q = glam::Quat::from_rotation_y(yaw_deg.to_radians()) * glam::Quat::from_rotation_x(pitch_deg.to_radians());
+        xr::Posef {
+            position: xr::Vector3f { x, y, z },
+            orientation: xr::Quaternionf { x: q.x, y: q.y, z: q.z, w: q.w },
+        }
+    }
+
+    #[test]
+    fn centring_puts_the_panels_in_front_of_the_head_wherever_it_is() {
+        // Head 1.5 m right of and 0.7 m behind the stage middle, turned 90 degrees to the left (looking along -X).
+        let (orient, origin) = scene_frame(&head(1.5, 1.2, 0.7, 90.0, 0.0), false);
+        assert_eq!(origin, glam::Vec3::new(1.5, 0.0, 0.7), "the origin is the floor spot under the head");
+        // A panel 2 m ahead at 1.4 m: ahead is -X now, the height stays the stage height.
+        let panel = origin + orient * glam::Vec3::new(0.0, 1.4, -2.0);
+        assert!((panel - glam::Vec3::new(-0.5, 1.4, 0.7)).length() < 1e-5, "{panel:?}");
+    }
+
+    #[test]
+    fn yaw_only_ignores_the_pitch_and_a_grip_keeps_it() {
+        let h = head(0.0, 1.0, 0.0, 0.0, 40.0);
+        let (upright, _) = scene_frame(&h, false);
+        let (locked, _) = scene_frame(&h, true);
+        let ahead = |q: glam::Quat| q * glam::Vec3::NEG_Z;
+        assert!(ahead(upright).y.abs() < 1e-5, "upright stays level");
+        assert!(ahead(locked).y > 0.5, "the grip locks to where the head points: {:?}", ahead(locked));
+    }
+
+    #[test]
+    fn only_a_real_move_of_steamvrs_centre_counts() {
+        let at = (glam::Vec3::new(0.0, 0.0, 0.0), glam::Quat::IDENTITY);
+        let jitter = (glam::Vec3::new(0.004, 0.0, -0.003), glam::Quat::from_rotation_y(0.2_f32.to_radians()));
+        let stepped = (glam::Vec3::new(0.3, 0.0, 0.0), glam::Quat::IDENTITY);
+        let turned = (glam::Vec3::ZERO, glam::Quat::from_rotation_y(25.0_f32.to_radians()));
+        assert!(!centre_moved(at, jitter));
+        assert!(centre_moved(at, stepped));
+        assert!(centre_moved(at, turned));
     }
 }

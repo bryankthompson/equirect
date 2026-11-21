@@ -7,6 +7,7 @@ struct Viewport { size: vec2f, _pad: vec2f }
 @group(0) @binding(1) var glyph_atlas:  texture_2d<f32>;
 @group(0) @binding(2) var sprite_atlas: texture_2d<f32>;
 @group(0) @binding(3) var atlas_sampler: sampler;
+@group(0) @binding(4) var thumb_atlas:  texture_2d<f32>;
 
 struct VertexIn {
     @location(0) pos:   vec2f,
@@ -43,9 +44,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4f {
         // Glyph: R8 alpha mask, modulated by tint.
         let alpha = textureSample(glyph_atlas, atlas_sampler, in.uv).r;
         rgba = vec4f(in.color.rgb, in.color.a * alpha);
-    } else {
+    } else if (in.mode == 2u) {
         // Sprite: RGBA texture, modulated by tint.
         let s = textureSample(sprite_atlas, atlas_sampler, in.uv);
+        rgba = s * in.color;
+    } else {
+        // Thumbnail (a video's picture in the browser): RGBA texture, modulated by tint.
+        let s = textureSample(thumb_atlas, atlas_sampler, in.uv);
         rgba = s * in.color;
     }
     // Premultiply for the (One, OneMinusSrcAlpha) blend at the consumer.

@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
     event_loop::ActiveEventLoop,
     window::{Window, WindowId},
 };
@@ -12,8 +12,11 @@ use winit::{
 use crate::pointer_renderer::PointerRenderer;
 use crate::renderer::Renderer;
 use crate::ui::browser::{BrowserEntry, BrowserState, Location};
-use crate::ui::settings::VideoSettings;
+use crate::ui::settings::{SettingsTab, SettingsView, VideoSettings};
 use crate::video_layer::{VideoSwapchain, use_xr_layer};
+use crate::library::Library;
+use crate::telemetry::Telemetry;
+use crate::resume;
 use crate::video_meta;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -34,6 +37,17 @@ fn source_display_name(s: &str) -> String {
             .unwrap_or("")
             .to_string()
     }
+}
+
+/// The browser panel at the size the user chose (the text and thumbnails keep their pixel size, so a bigger panel holds more).
+fn browser_panel_for(
+    device: &wgpu::Device,
+    fmt: wgpu::TextureFormat,
+    pos: glam::Vec3,
+    size: crate::browser_prefs::PanelSize,
+) -> PanelRenderer {
+    let (w_px, h_px, w_m, h_m) = size.dims();
+    PanelRenderer::new(device, fmt, w_px, h_px, pos, w_m, h_m)
 }
 
 fn source_to_location(s: &str) -> Location {
@@ -80,7 +94,7 @@ fn adjacent_video(
     };
 
     let videos: Vec<String> = entries.iter().filter_map(|e| {
-        if let BrowserEntry::Video(_, loc) = e {
+        if let BrowserEntry::Video(_, loc, _) = e {
             Some(location_to_source(loc.clone()))
         } else {
             None
@@ -125,6 +139,83 @@ fn save_meta(source: &str, meta: &video_meta::VideoMeta) {
     }
 }
 
+fn store_meta(source: &str, meta: &video_meta::VideoMeta) {
+    if is_url(source) {
+        video_meta::store_url(source, meta);
+    } else {
+        video_meta::store(std::path::Path::new(source), meta);
+    }
+}
+
+/// What the position file of the playing video holds, as last written here: (video, position; None is "start over").
+type PositionWritten = Option<(String, Option<f64>)>;
+
+/// Write where `source` stopped (`pos` of `duration` seconds), or forget it near the start and the end (`resume.rs` has the
+/// rules). Leaves the video's settings alone; a video with no settings file yet gets `settings` saved with the position.
+fn write_position(
+    written: &mut PositionWritten,
+    source: &str,
+    pos: f64,
+    duration: f64,
+    settings: &crate::ui::settings::VideoSettings,
+) {
+    let keep = resume::worth_keeping(pos, duration);
+    let same = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() < 1.0,
+        (None, None) => true,
+        _ => false,
+    };
+    if let Some((s, p)) = written {
+        if s == source && same(*p, keep) { return; }
+    }
+    let mut meta = match load_meta(source) {
+        Some(m) => m,
+        None if keep.is_none() => { *written = Some((source.to_string(), None)); return; } // nothing on file to forget
+        None => video_meta::VideoMeta::new(settings.clone()),
+    };
+    if !same(meta.position_secs, keep) {
+        meta.position_secs = keep;
+        store_meta(source, &meta);
+    }
+    *written = Some((source.to_string(), keep));
+}
+
+// The two next macros are used where `renderer` or `mode` is borrowed from `self`, so they touch only the fields they need
+// (a method on `self` would not compile there).
+
+/// Save where the playing video is (see `write_position`).
+macro_rules! remember_position {
+    ($s:expr) => {
+        if let (Some(src), true) = ($s.video_source.as_deref(), $s.video_decoder.is_some()) {
+            write_position(
+                &mut $s.position_written, src,
+                $s.control_bar_state.current_secs, $s.control_bar_state.duration_secs, &$s.video_settings,
+            );
+        }
+    };
+}
+
+/// A video that was stopped part way starts where it stopped, with a "Resumed at" note on the control bar (brought up for a few
+/// seconds if it was hidden). `$allowed` false (the same video picked again) starts it from the beginning instead.
+macro_rules! resume_into {
+    ($s:expr, $source:expr, $decoder:expr, $allowed:expr) => {{
+        $s.control_bar_state.notice = None;
+        $s.resume_notice_until = None;
+        let duration = if $decoder.duration_us > 0 { $decoder.duration_us as f64 / 1_000_000.0 } else { 0.0 };
+        let saved = if $allowed { load_meta($source).and_then(|m| m.position_secs) } else { None };
+        if let Some(start) = resume::start_for(saved, duration) {
+            *$decoder.seek_request.lock().unwrap() = Some((start * 1_000_000.0) as u64);
+            $s.control_bar_state.current_secs = start;
+            $s.seek_target_secs = Some(start);
+            $s.seek_timeout = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+            $s.control_bar_state.notice = Some(format!("Resumed at {}", crate::ui::control_bar::fmt_time(start)));
+            $s.resume_notice_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
+            $s.resume_hides_panel = $s.panel_mode == PanelMode::Hidden;
+            if $s.resume_hides_panel { $s.panel_mode = PanelMode::ControlBar; }
+            crate::diag::log(&format!("resume: {} at {}", source_display_name($source), crate::ui::control_bar::fmt_time(start)));
+        }
+    }};
+}
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -138,7 +229,10 @@ enum PanelMode {
 use crate::local::LocalMode;
 use crate::mode::Mode;
 use crate::ui::assets::UiAssets;
-use crate::ui::control_bar::{ControlBarState, SPEEDS};
+/// Colour cells in the seek bar's heat strip.
+const HEAT_CELLS: usize = 200;
+
+use crate::ui::control_bar::{ControlBarState, SPEEDS, info_extra_height, video_info};
 use crate::ui::panel::PanelRenderer;
 use crate::video::decoder::VideoDecoder;
 use crate::video::texture::VideoTexture;
@@ -161,11 +255,27 @@ pub struct App {
     panel_renderer: Option<PanelRenderer>,
     pointer_renderer: Option<PointerRenderer>,
     control_bar_state: ControlBarState,
+    /// The user's favorites (library.json).
+    library: Library,
+    /// Play position for the Handy bridge (UDP), if switched on.
+    telemetry: Option<Telemetry>,
     /// Current video source: a local file path or an http(s):// URL.
     video_source: Option<String>,
+    /// The source whose `.nfo` notes are in `control_bar_state.info` (read once per video).
+    info_source: Option<String>,
+    /// The funscript beside the playing video, for the heat map on the seek bar, and what the strip was cut for.
+    heat_script: Option<crate::heatmap::Script>,
+    heat_source: Option<String>,
+    heat_duration: f64,
+    /// How many pixels taller than plain the control bar panel is, to hold those notes.
+    panel_extra_px: u32,
     // File browser
     browser_state: Option<BrowserState>,
     browser_panel: Option<PanelRenderer>,
+    /// Pins, thumbnail size and panel size of the browser: saved in browser.json.
+    browser_prefs: crate::browser_prefs::BrowserPrefs,
+    /// Makes the browser's thumbnails (Windows shell thumbnails, a few background threads).
+    thumbs: std::sync::Arc<crate::thumbs::Thumbs>,
     /// Cached folder contents keyed by normalized location string.
     /// Persists across browser open/close cycles.  Entries are invalidated
     /// when the user explicitly clicks a folder to enter it.
@@ -174,17 +284,36 @@ pub struct App {
     initial_browser_dir: Option<PathBuf>,
     // Settings
     video_settings: VideoSettings,
+    /// Handy stroke range and invert: one value for every video, saved in haptics.json.
+    haptics: crate::haptics::Haptics,
+    /// Where the screen hangs: one value for every video, saved in screen.json.
+    screen: crate::screen::Screen,
+    /// Sound level and mute: one value for every video, saved in volume.json.
+    volume: crate::volume::Volume,
+    /// The speaker's click state and how long the volume slider stays on the control bar.
+    volume_row: crate::volume::VolumeRow,
+    settings_tab: SettingsTab,
     settings_panel: Option<PanelRenderer>,
     // Panel visibility
     panel_mode: PanelMode,
     seek_target_secs: Option<f64>,
+    /// What the position file of the playing video holds, as last written (to skip writing the same thing again).
+    position_written: PositionWritten,
+    position_saved_at: std::time::Instant,
+    /// The "Resumed at" note stays on the control bar until then; `resume_hides_panel`: the bar was brought up for it, so it goes again.
+    resume_notice_until: Option<std::time::Instant>,
+    resume_hides_panel: bool,
     seek_timeout: Option<std::time::Instant>,
+    /// Headset mode: the window holds the desktop mouse (first click), so it drives the panels.
+    mouse_captured: bool,
     /// IPC receiver: messages from a second-instance launch (file path or URL).
     ipc_rx: std::sync::mpsc::Receiver<String>,
     /// Pending IPC-requested video source, queued until VR is ready.
     pending_ipc_source: Option<String>,
     /// If set, seek to this position (seconds) once the first video opens.
     initial_start_secs: Option<f64>,
+    /// When the previous pass of the frame loop started, to log long gaps (see diag.rs).
+    last_pass: Option<std::time::Instant>,
 }
 
 
@@ -201,6 +330,12 @@ impl App {
         } else {
             PanelMode::ControlBar
         };
+        let (library, library_error) = Library::open();
+        let mut control_bar_state = ControlBarState::default();
+        if let Some(e) = library_error {
+            eprintln!("Library: {e}");
+            control_bar_state.error = Some(e);
+        }
         Self {
             mode: None,
             local_mode,
@@ -212,20 +347,70 @@ impl App {
             video_swapchain: None,
             panel_renderer: None,
             pointer_renderer: None,
-            control_bar_state: ControlBarState::default(),
+            control_bar_state,
+            library,
+            telemetry: Telemetry::from_env(),
             video_source,
+            info_source: None,
+            heat_script: None,
+            heat_source: None,
+            heat_duration: 0.0,
+            panel_extra_px: 0,
             browser_state: None,
             browser_panel: None,
+            browser_prefs: {
+                let (p, problem) = crate::browser_prefs::load();
+                if let Some(e) = problem {
+                    eprintln!("Browser: {e}");
+                    crate::diag::log(&format!("browser: {e}"));
+                }
+                crate::browser_prefs::apply_exclusions(&p);
+                p
+            },
+            thumbs: crate::thumbs::Thumbs::new(),
             folder_cache: std::collections::HashMap::new(),
             initial_browser_dir,
             video_settings: VideoSettings::new(),
+            haptics: {
+                let (h, problem) = crate::haptics::load();
+                if let Some(p) = problem {
+                    eprintln!("Haptics: {p}");
+                    crate::diag::log(&format!("haptics: {p}"));
+                }
+                h
+            },
+            screen: {
+                let (s, problem) = crate::screen::load();
+                if let Some(p) = problem {
+                    eprintln!("Screen: {p}");
+                    crate::diag::log(&format!("screen: {p}"));
+                }
+                s
+            },
+            volume_row: Default::default(),
+            volume: {
+                let (v, problem) = crate::volume::load();
+                if let Some(p) = problem {
+                    eprintln!("Volume: {p}");
+                    crate::diag::log(&format!("volume: {p}"));
+                }
+                crate::volume::publish(&v);
+                v
+            },
+            settings_tab: SettingsTab::default(),
             settings_panel: None,
             panel_mode,
             seek_target_secs: None,
+            position_written: None,
+            position_saved_at: std::time::Instant::now(),
+            resume_notice_until: None,
+            resume_hides_panel: false,
             seek_timeout: None,
+            mouse_captured: false,
             ipc_rx,
             pending_ipc_source: None,
             initial_start_secs,
+            last_pass: None,
         }
     }
 }
@@ -310,16 +495,31 @@ impl ApplicationHandler for App {
             .unwrap_or_else(|| renderer.surface_format());
 
         if let Some(ref source) = self.video_source {
+            let mut from_saved = false;
             if let Some(meta) = load_meta(source) {
                 self.video_settings = meta.settings;
+                from_saved = true;
+            } else if let Some(s) = video_meta::detect_from_name(source) {
+                eprintln!("Video: settings guessed from the file name");
+                self.video_settings = s;
             }
-            match VideoDecoder::open(source.clone()) {
+            let open_started = std::time::Instant::now();
+            let opened = VideoDecoder::open(source.clone());
+            crate::diag::slow(&format!("opening {}", source_display_name(source)), open_started, 300);
+            match opened {
                 Err(e) => {
                     self.control_bar_state.error = Some(format!("Can't play video: {e}"));
                     self.panel_mode = PanelMode::ControlBar;
                 }
                 Ok(decoder) => {
                     self.control_bar_state.error = None;
+                    // Not seen before: now that the size is known, fill in what the name left out.
+                    if !from_saved {
+                        if let Some(s) = video_meta::guess_layout(source, Some((decoder.width, decoder.height))) {
+                            save_meta(source, &video_meta::VideoMeta::new(s.clone()));
+                            self.video_settings = s;
+                        }
+                    }
                     let tex = decoder.gpu_bgra_handle
                         .and_then(|h| VideoTexture::new_gpu(
                             &renderer.device, &renderer.instance, &renderer.adapter,
@@ -340,7 +540,7 @@ impl ApplicationHandler for App {
                         self.control_bar_state.duration_secs =
                             decoder.duration_us as f64 / 1_000_000.0;
                     }
-                    // --start / -t: seek to the requested position on first open.
+                    // --start / -t: seek to the requested position on first open (it wins over a resume).
                     if let Some(secs) = self.initial_start_secs.take() {
                         let target_us = (secs * 1_000_000.0) as u64;
                         *decoder.seek_request.lock().unwrap() = Some(target_us);
@@ -349,6 +549,8 @@ impl ApplicationHandler for App {
                         self.seek_timeout = Some(
                             std::time::Instant::now() + std::time::Duration::from_secs(30),
                         );
+                    } else {
+                        resume_into!(self, source, decoder, true);
                     }
                     self.video_decoder   = Some(decoder);
                     self.video_texture   = Some(tex);
@@ -365,18 +567,13 @@ impl ApplicationHandler for App {
         // around the icon row, no empty space below the slider.  The constants
         // come from control_bar.rs so changing the icon count or row heights
         // there automatically resizes the panel.
-        use crate::ui::control_bar::{CONTROL_BAR_CONTENT_H, CONTROL_BAR_CONTENT_W};
-        use crate::ui::ui::PADDING as UI_PADDING;
-        let cb_pixel_w = (CONTROL_BAR_CONTENT_W + UI_PADDING * 2.0).ceil() as u32;
-        let cb_pixel_h = (CONTROL_BAR_CONTENT_H + UI_PADDING * 2.0).ceil() as u32;
-        let cb_world_w = 1.6_f32;
-        let cb_world_h = cb_world_w * cb_pixel_h as f32 / cb_pixel_w as f32;
+        let (cb_w_px, cb_h_px, cb_w_m, cb_h_m) = crate::ui::control_bar::panel_size(0);
 
         self.panel_renderer = Some(PanelRenderer::new(
             &renderer.device, target_fmt,
-            cb_pixel_w, cb_pixel_h,
+            cb_w_px, cb_h_px,
             cb_pos,
-            cb_world_w, cb_world_h,
+            cb_w_m, cb_h_m,
         ));
 
         self.pointer_renderer = Some(PointerRenderer::new(&renderer.device, target_fmt));
@@ -385,16 +582,11 @@ impl ApplicationHandler for App {
             let current_loc = self.video_source.as_deref().map(source_to_location);
             let loc = Location::Local(dir);
             let cached = self.folder_cache.get(&cache_key(&loc)).cloned();
-            self.browser_state = Some(BrowserState::new(loc, current_loc, cached));
-            self.browser_panel = Some(PanelRenderer::new(
-                &renderer.device, target_fmt,
-                800, 600,
-                browser_pos,
-                1.6, 1.2,
-            ));
+            self.browser_state = Some(BrowserState::new(loc, current_loc, cached, self.browser_prefs.clone(), self.thumbs.clone()));
+            self.browser_panel = Some(browser_panel_for(&renderer.device, target_fmt, browser_pos, self.browser_prefs.panel));
         }
 
-        self.ui_assets = Some(UiAssets::new(&renderer.device, &renderer.queue));
+        self.ui_assets = Some(UiAssets::new(&renderer.device, &renderer.queue, self.thumbs.clone()));
         self.renderer = Some(renderer);
         self.mode = mode;
     }
@@ -402,11 +594,46 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Forward every event to the active mode (LocalMode uses these for
         // mouse/keyboard input; VrContext ignores them).
-        if let Some(m) = &mut self.mode {
+        // Headset mode: the first left click grabs the mouse (cursor hidden, kept inside the
+        // window) so it can drive the panels; losing focus (Alt+Tab) gives it back.  The grabbing
+        // click itself is not passed on, or it would press whatever the dot sits on.
+        let mut pass_on = true;
+        if let (Some(m), Some(r)) = (&mut self.mode, &self.renderer) {
+            if !m.renders_to_window() {
+                match &event {
+                    WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
+                        if !self.mouse_captured =>
+                    {
+                        let w = r.window();
+                        if let Err(e) = w.set_cursor_grab(winit::window::CursorGrabMode::Confined) {
+                            eprintln!("mouse: cannot confine the cursor: {e}");
+                        }
+                        w.set_cursor_visible(false);
+                        self.mouse_captured = true;
+                        m.set_mouse_active(true);
+                        eprintln!("mouse: captured by the player window (Alt+Tab to release)");
+                        pass_on = false;
+                    }
+                    WindowEvent::Focused(false) if self.mouse_captured => {
+                        let w = r.window();
+                        let _ = w.set_cursor_grab(winit::window::CursorGrabMode::None);
+                        w.set_cursor_visible(true);
+                        self.mouse_captured = false;
+                        m.set_mouse_active(false);
+                        eprintln!("mouse: released");
+                    }
+                    _ => {}
+                }
+            }
+            if pass_on { m.handle_window_event(&event); }
+        } else if let Some(m) = &mut self.mode {
             m.handle_window_event(&event);
         }
         match event {
-            WindowEvent::CloseRequested => { event_loop.exit(); }
+            WindowEvent::CloseRequested => {
+                remember_position!(self);
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer { r.resize(size); }
             }
@@ -428,8 +655,31 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let Some(m) = &mut self.mode {
+            m.handle_device_event(&event);
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(renderer) = &self.renderer else { return };
+
+        // A pass that comes much later than the last one is a freeze: write down what was going on.
+        if let Some(prev) = self.last_pass {
+            let gap = prev.elapsed().as_millis();
+            if gap >= 250 {
+                let mode = match self.panel_mode {
+                    PanelMode::ControlBar => "controls", PanelMode::Browser => "browser",
+                    PanelMode::Settings => "settings", PanelMode::Hidden => "hidden",
+                };
+                crate::diag::log(&format!(
+                    "slow: frame loop paused {gap} ms (panel: {mode}, playing: {}, video: {})",
+                    self.control_bar_state.is_playing,
+                    self.video_source.as_deref().map_or("none".to_string(), source_display_name),
+                ));
+            }
+        }
+        self.last_pass = Some(std::time::Instant::now());
 
         // Poll IPC channel for messages from a second instance.
         while let Ok(msg) = self.ipc_rx.try_recv() {
@@ -473,8 +723,26 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Remember where playback is every few seconds, and take the "Resumed at" note off again.
+        if self.control_bar_state.is_playing && self.seek_target_secs.is_none()
+            && self.position_saved_at.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            self.position_saved_at = std::time::Instant::now();
+            remember_position!(self);
+        }
+        if let Some(until) = self.resume_notice_until {
+            if std::time::Instant::now() >= until {
+                self.resume_notice_until = None;
+                self.control_bar_state.notice = None;
+                if self.resume_hides_panel && self.panel_mode == PanelMode::ControlBar {
+                    self.panel_mode = PanelMode::Hidden;
+                }
+            }
+        }
+
         if let Some(mode) = &mut self.mode {
             if mode.exit_requested() {
+                remember_position!(self);
                 event_loop.exit();
                 return;
             }
@@ -490,7 +758,8 @@ impl ApplicationHandler for App {
 
             let use_layer = mode.supports_video_layer()
                 && use_xr_layer(&self.video_settings, mode.supports_equirect2());
-            let video_settings_snap = self.video_settings.clone();
+            let mut video_settings_snap = self.video_settings.clone();
+            video_settings_snap.screen = self.screen;
             let video_layer_arg =
                 if use_layer { self.video_swapchain.as_mut().map(|sc| (sc, &video_settings_snap)) }
                 else { None };
@@ -500,6 +769,63 @@ impl ApplicationHandler for App {
                     .map(|(r, t)| (r, t, &video_settings_snap))
             } else { None };
 
+            self.control_bar_state.is_favorite = self.video_source.as_deref()
+                .map_or(false, |s| self.library.is_favorite(s));
+            self.control_bar_state.muted = self.volume.muted;
+            self.control_bar_state.volume_percent = self.volume.percent;
+            self.control_bar_state.volume_open = self.volume_row.is_open(std::time::Instant::now());
+            if let (Some(tel), Some(src), Some(_)) =
+                (self.telemetry.as_mut(), self.video_source.as_deref(), self.video_decoder.as_ref())
+            {
+                tel.tick(
+                    src,
+                    self.control_bar_state.current_secs,
+                    self.control_bar_state.is_playing,
+                    SPEEDS[self.control_bar_state.speed_index],
+                    (self.video_settings.haptics_offset_ms, self.haptics.clone()),
+                );
+            }
+            // ── heat map from the funscript: read once per video, cut again when the length is known ──
+            if self.heat_source != self.video_source {
+                self.heat_source = self.video_source.clone();
+                self.heat_script = self.video_source.as_deref()
+                    .filter(|s| !is_url(s))
+                    .and_then(|s| crate::heatmap::read_beside(std::path::Path::new(s)));
+                self.heat_duration = 0.0;
+                self.control_bar_state.heat.clear();
+            }
+            let duration = self.control_bar_state.duration_secs;
+            if let Some(script) = &self.heat_script {
+                if duration > 0.0 && (duration - self.heat_duration).abs() > 0.5 {
+                    self.heat_duration = duration;
+                    self.control_bar_state.heat = script.heat(duration, HEAT_CELLS);
+                }
+            }
+            // ── notes from the video's .nfo: read once per video, read-only ───────
+            if self.info_source != self.video_source {
+                self.info_source = self.video_source.clone();
+                let name = self.video_source.as_deref().map(source_display_name).unwrap_or_default();
+                let nfo = self.video_source.as_deref()
+                    .filter(|s| !is_url(s))
+                    .and_then(|s| crate::nfo::read_beside(std::path::Path::new(s)));
+                let atlas = &mut self.ui_assets.as_mut().expect("UiAssets not initialised").atlas;
+                self.control_bar_state.info = nfo.and_then(|n| video_info(&n, &name, atlas));
+                let extra = info_extra_height(self.control_bar_state.info.as_ref(), atlas).ceil() as u32;
+                if extra != self.panel_extra_px {
+                    // Grow upward: the bottom edge, and so the buttons, stay where they were.
+                    let (w_px, h_px, w_m, h_m) = crate::ui::control_bar::panel_size(extra);
+                    let mut pos = mode.control_bar_position();
+                    pos.y += (h_m - crate::ui::control_bar::panel_size(0).3) / 2.0;
+                    self.panel_renderer = Some(PanelRenderer::new(
+                        &renderer.device, mode.target_format(),
+                        w_px, h_px,
+                        pos,
+                        w_m, h_m,
+                    ));
+                    self.panel_extra_px = extra;
+                    crate::diag::log(&format!("notes: control bar is {extra} px taller"));
+                }
+            }
             let panel_arg =
                 if self.panel_mode == PanelMode::ControlBar {
                     self.panel_renderer.as_mut().map(|p| (p, &self.control_bar_state))
@@ -510,7 +836,13 @@ impl ApplicationHandler for App {
                 } else { None };
             let settings_arg =
                 if self.panel_mode == PanelMode::Settings {
-                    self.settings_panel.as_mut().map(|p| (p, &mut self.video_settings))
+                    self.settings_panel.as_mut().map(|p| (p, SettingsView {
+                        video:   &mut self.video_settings,
+                        haptics: &mut self.haptics,
+                        screen:  &mut self.screen,
+                        volume:  &mut self.volume,
+                        tab:     &mut self.settings_tab,
+                    }))
                 } else { None };
             let pointer_arg =
                 if self.panel_mode != PanelMode::Hidden { self.pointer_renderer.as_ref() }
@@ -528,12 +860,79 @@ impl ApplicationHandler for App {
                 pointer_arg,
             );
 
+            // ── sound: a click on the speaker opens the volume slider, a double click mutes; the Audio page sets it too ─
+            let now = std::time::Instant::now();
+            let mut volume_changed = settings_actions.volume_changed;
+            if actions.speaker_clicked && self.volume_row.click(now) {
+                self.volume.muted = !self.volume.muted;
+                volume_changed = true;
+            }
+            if let Some(percent) = actions.set_volume {
+                self.volume.set_percent(percent as f32);
+                self.volume.muted = false; // moving the slider means "I want to hear it"
+                self.volume_row.touch(now);
+                volume_changed = true;
+            }
+            if volume_changed {
+                crate::volume::publish(&self.volume);
+                if let Err(e) = crate::volume::save(&self.volume) {
+                    eprintln!("Volume: {e}");
+                    crate::diag::log(&format!("volume: {e}"));
+                }
+            }
+
+            // ── favorites ─────────────────────────────────────────────────────
+
+            if actions.toggle_favorite {
+                if let Some(src) = self.video_source.clone() {
+                    let (now, err) = self.library.toggle(&src);
+                    eprintln!("Library: {} {}", if now { "favorite added:" } else { "favorite removed:" }, src);
+                    if let Some(e) = err {
+                        eprintln!("Library: {e}");
+                        self.control_bar_state.error = Some(format!("Favorite not saved: {e}"));
+                    }
+                }
+            }
+            if browser_actions.open_favorites {
+                let mut entries = vec![BrowserEntry::Parent];
+                for fav in self.library.favorites() {
+                    let loc = source_to_location(&fav.source);
+                    let scripted = match &loc {
+                        Location::Local(p) => p.with_extension("funscript").is_file(),
+                        Location::Remote(_) => false,
+                    };
+                    entries.push(BrowserEntry::Video(source_display_name(&fav.source), loc, scripted));
+                }
+                if let Some(bs) = &mut self.browser_state {
+                    bs.favorite_entries = entries;
+                    bs.showing_favorites = true;
+                }
+            }
+
             // ── browser actions ───────────────────────────────────────────────
 
             if browser_actions.close {
                 self.browser_state = None;
                 self.browser_panel = None;
                 self.panel_mode    = PanelMode::ControlBar;
+            }
+
+            // A pin, the thumbnail size or the panel size changed: remember it, and hang a panel of the new size.
+            if browser_actions.prefs_changed {
+                if let Some(bs) = &self.browser_state {
+                    let resized = bs.prefs.panel != self.browser_prefs.panel;
+                    self.browser_prefs = bs.prefs.clone();
+                    crate::browser_prefs::apply_exclusions(&self.browser_prefs);
+                    if let Err(e) = crate::browser_prefs::save(&self.browser_prefs) {
+                        eprintln!("Browser: {e}");
+                        crate::diag::log(&format!("browser: {e}"));
+                    }
+                    if resized && self.browser_panel.is_some() {
+                        self.browser_panel = Some(browser_panel_for(
+                            &renderer.device, mode.target_format(), mode.browser_position(), self.browser_prefs.panel,
+                        ));
+                    }
+                }
             }
 
             // ".." / parent navigation — use cache.
@@ -606,13 +1005,10 @@ impl ApplicationHandler for App {
                     let current_loc = self.video_source.as_deref().map(source_to_location);
                     let loc = Location::Local(dir);
                     let cached = self.folder_cache.get(&cache_key(&loc)).cloned();
-                    self.browser_state = Some(BrowserState::new(loc, current_loc, cached));
+                    self.browser_state = Some(BrowserState::new(loc, current_loc, cached, self.browser_prefs.clone(), self.thumbs.clone()));
                     if self.browser_panel.is_none() {
-                        self.browser_panel = Some(PanelRenderer::new(
-                            &renderer.device, mode.target_format(),
-                            800, 600,
-                            mode.browser_position(),
-                            1.6, 1.2,
+                        self.browser_panel = Some(browser_panel_for(
+                            &renderer.device, mode.target_format(), mode.browser_position(), self.browser_prefs.panel,
                         ));
                     }
                     self.panel_mode = PanelMode::Browser;
@@ -635,21 +1031,36 @@ impl ApplicationHandler for App {
 
             if let Some(new_source) = play_source {
                 let target_fmt = mode.target_format();
+                // Where the video that is leaving stopped; picking the playing video again starts it over.
+                remember_position!(self);
+                let same_video = self.video_source.as_deref() == Some(new_source.as_str());
 
                 self.video_settings = load_meta(&new_source)
                     .map(|m| m.settings)
                     .unwrap_or_else(|| {
-                        let inherited = self.video_settings.clone();
-                        save_meta(&new_source, &video_meta::VideoMeta { settings: inherited.clone() });
-                        inherited
+                        // No saved settings: guess from the file name; a name with no hint is
+                        // shown flat (not the previous video's settings, which broke 2D clips
+                        // played after a 180 one).
+                        match video_meta::detect_from_name(&new_source) {
+                            Some(s) => {
+                                save_meta(&new_source, &video_meta::VideoMeta::new(s.clone()));
+                                s
+                            }
+                            None => crate::ui::settings::VideoSettings::new(),
+                        }
                     });
+
+                let from_saved = load_meta(&new_source).is_some();
 
                 self.video_swapchain = None;
                 self.video_decoder   = None;
                 self.video_texture   = None;
                 self.video_renderer  = None;
 
-                match VideoDecoder::open(new_source.clone()) {
+                let open_started = std::time::Instant::now();
+                let opened = VideoDecoder::open(new_source.clone());
+                crate::diag::slow(&format!("opening {}", source_display_name(&new_source)), open_started, 300);
+                match opened {
                     Err(e) => {
                         self.control_bar_state.error = Some(format!("Can't play video: {e}"));
                         self.panel_mode  = PanelMode::ControlBar;
@@ -657,6 +1068,13 @@ impl ApplicationHandler for App {
                     }
                     Ok(decoder) => {
                         self.control_bar_state.error = None;
+                        // Not seen before: now that the size is known, fill in what the name left out.
+                        if !from_saved {
+                            if let Some(s) = video_meta::guess_layout(&new_source, Some((decoder.width, decoder.height))) {
+                                save_meta(&new_source, &video_meta::VideoMeta::new(s.clone()));
+                                self.video_settings = s;
+                            }
+                        }
                         let tex = decoder.gpu_bgra_handle
                             .and_then(|h| VideoTexture::new_gpu(
                                 &renderer.device, &renderer.instance, &renderer.adapter,
@@ -678,6 +1096,7 @@ impl ApplicationHandler for App {
                             else { 0.0 };
                         self.control_bar_state.current_secs = 0.0;
                         self.control_bar_state.is_playing   = true;
+                        resume_into!(self, &new_source, decoder, !same_video);
                         self.video_source    = Some(new_source);
                         self.video_decoder   = Some(decoder);
                         self.video_texture   = Some(tex);
@@ -689,11 +1108,40 @@ impl ApplicationHandler for App {
 
             // ── settings actions ──────────────────────────────────────────────
 
+            // Reset: the settings-screen button, or both grips squeezed together (which also
+            // brings the control bar back, in case the settings screen is the problem).
+            if settings_actions.reset || actions.reset_settings {
+                let src = self.video_source.clone();
+                let dims = self.video_decoder.as_ref().map(|d| (d.width, d.height));
+                let fresh = src.as_deref()
+                    .and_then(|s| video_meta::guess_layout(s, dims))
+                    .unwrap_or_else(crate::ui::settings::VideoSettings::new);
+                self.video_settings = fresh.clone();
+                if let Some(s) = &src {
+                    save_meta(s, &video_meta::VideoMeta::new(fresh));
+                }
+                if actions.reset_settings {
+                    self.panel_mode = PanelMode::ControlBar;
+                }
+            }
+            if settings_actions.center {
+                mode.center();
+            }
             if settings_actions.changed {
                 if let Some(ref source) = self.video_source {
-                    save_meta(source, &video_meta::VideoMeta {
-                        settings: self.video_settings.clone(),
-                    });
+                    save_meta(source, &video_meta::VideoMeta::new(self.video_settings.clone()));
+                }
+            }
+            if settings_actions.haptics_changed {
+                if let Err(e) = crate::haptics::save(&self.haptics) {
+                    eprintln!("Haptics: {e}");
+                    crate::diag::log(&format!("haptics: {e}"));
+                }
+            }
+            if settings_actions.screen_changed {
+                if let Err(e) = crate::screen::save(&self.screen) {
+                    eprintln!("Screen: {e}");
+                    crate::diag::log(&format!("screen: {e}"));
                 }
             }
             if settings_actions.close {
@@ -795,18 +1243,24 @@ impl ApplicationHandler for App {
 
                 if let Some(new_source) = next {
                     let target_fmt = mode.target_format();
+                    remember_position!(self);
+                    // Same rule as picking from the browser: saved settings, else a guess from the
+                    // name (flat when the name says nothing), never the previous video's settings.
+                    let from_saved = load_meta(&new_source).is_some();
                     self.video_settings = load_meta(&new_source)
                         .map(|m| m.settings)
                         .unwrap_or_else(|| {
-                            let inherited = self.video_settings.clone();
-                            save_meta(&new_source, &video_meta::VideoMeta { settings: inherited.clone() });
-                            inherited
+                            video_meta::detect_from_name(&new_source)
+                                .unwrap_or_else(crate::ui::settings::VideoSettings::new)
                         });
                     self.video_swapchain = None;
                     self.video_decoder   = None;
                     self.video_texture   = None;
                     self.video_renderer  = None;
-                    match VideoDecoder::open(new_source.clone()) {
+                    let open_started = std::time::Instant::now();
+                let opened = VideoDecoder::open(new_source.clone());
+                crate::diag::slow(&format!("opening {}", source_display_name(&new_source)), open_started, 300);
+                match opened {
                         Err(e) => {
                             self.control_bar_state.error = Some(format!("Can't play video: {e}"));
                             self.panel_mode  = PanelMode::ControlBar;
@@ -814,6 +1268,12 @@ impl ApplicationHandler for App {
                         }
                         Ok(decoder) => {
                             self.control_bar_state.error = None;
+                            if !from_saved {
+                                if let Some(s) = video_meta::guess_layout(&new_source, Some((decoder.width, decoder.height))) {
+                                    save_meta(&new_source, &video_meta::VideoMeta::new(s.clone()));
+                                    self.video_settings = s;
+                                }
+                            }
                             let tex = decoder.gpu_bgra_handle
                                 .and_then(|h| VideoTexture::new_gpu(
                                     &renderer.device, &renderer.instance, &renderer.adapter,
@@ -835,6 +1295,7 @@ impl ApplicationHandler for App {
                                 else { 0.0 };
                             self.control_bar_state.current_secs = 0.0;
                             self.control_bar_state.is_playing   = true;
+                            resume_into!(self, &new_source, decoder, true);
                             self.video_source    = Some(new_source);
                             self.video_decoder   = Some(decoder);
                             self.video_texture   = Some(tex);
@@ -874,12 +1335,9 @@ impl ApplicationHandler for App {
                     };
                     let current_loc = self.video_source.as_deref().map(source_to_location);
                     let cached = self.folder_cache.get(&cache_key(&start_loc)).cloned();
-                    self.browser_state = Some(BrowserState::new(start_loc, current_loc, cached));
-                    self.browser_panel = Some(PanelRenderer::new(
-                        &renderer.device, mode.target_format(),
-                        800, 600,
-                        mode.browser_position(),
-                        1.6, 1.2,
+                    self.browser_state = Some(BrowserState::new(start_loc, current_loc, cached, self.browser_prefs.clone(), self.thumbs.clone()));
+                    self.browser_panel = Some(browser_panel_for(
+                        &renderer.device, mode.target_format(), mode.browser_position(), self.browser_prefs.panel,
                     ));
                 }
                 self.panel_mode = PanelMode::Browser;
@@ -895,6 +1353,10 @@ impl ApplicationHandler for App {
             }
 
             if actions.exit {
+                if let (Some(tel), Some(src)) = (self.telemetry.as_mut(), self.video_source.as_deref()) {
+                    tel.stop(src, self.control_bar_state.current_secs, SPEEDS[self.control_bar_state.speed_index]);
+                }
+                remember_position!(self);
                 mode.request_exit();
                 event_loop.exit();
             }

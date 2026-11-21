@@ -381,6 +381,9 @@ pub fn zoom_angles(base_h: f32, base_v_up: f32, base_v_dn: f32, zoom: f32) -> (f
 /// runtime doesn't support `XR_KHR_composition_layer_equirect2` (shader sphere fallback).
 pub fn use_xr_layer(settings: &VideoSettings, has_equirect2: bool) -> bool {
     use crate::ui::settings::Projection;
+    // SteamVR draws quad/cylinder layers as overlays that cover the control panels, so
+    // everything is drawn in the scene by default. EQUIRECT_USE_LAYER=1 brings the layers back.
+    if std::env::var_os("EQUIRECT_USE_LAYER").is_none() { return false; }
     if matches!(settings.proj, Projection::Fisheye) { return false; }
     match settings.mode {
         VideoMode::View180 | VideoMode::View360 => has_equirect2,

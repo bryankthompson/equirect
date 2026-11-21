@@ -67,6 +67,16 @@ impl UiRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding:    4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled:   false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -151,8 +161,8 @@ impl UiRenderer {
 
     /// Render `draw_list` into `target` at the given pixel size.  `target`
     /// must already exist; this pass clears it to transparent black before
-    /// drawing.  `glyph_atlas` is sampled for `QuadKind::Glyph` quads, and
-    /// `sprite_atlas` for `QuadKind::Sprite` quads.
+    /// drawing.  `glyph_atlas` is sampled for `QuadKind::Glyph` quads,
+    /// `sprite_atlas` for `QuadKind::Sprite` quads and `thumb_atlas` for `QuadKind::Thumb`.
     pub fn render(
         &mut self,
         device:        &wgpu::Device,
@@ -163,6 +173,7 @@ impl UiRenderer {
         draw_list:     &DrawList,
         glyph_atlas:   &wgpu::TextureView,
         sprite_atlas:  &wgpu::TextureView,
+        thumb_atlas:   &wgpu::TextureView,
     ) {
         // ── upload viewport + vertices ─────────────────────────────────────
         queue.write_buffer(
@@ -201,6 +212,7 @@ impl UiRenderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(glyph_atlas) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(sprite_atlas) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(thumb_atlas) },
             ],
         });
 

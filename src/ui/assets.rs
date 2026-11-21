@@ -14,6 +14,10 @@ pub struct UiAssets {
     #[allow(dead_code)]
     pub icon_texture: wgpu::Texture,
     pub icon_view:    wgpu::TextureView,
+    /// The browser's thumbnails: the texture they are drawn from, and the engine that fills it.
+    pub thumb_texture: wgpu::Texture,
+    pub thumb_view:    wgpu::TextureView,
+    pub thumbs:        std::sync::Arc<crate::thumbs::Thumbs>,
 }
 
 /// Format every panel's offscreen UI texture uses.  The `UiRenderer` pipeline
@@ -22,11 +26,12 @@ pub struct UiAssets {
 pub const PANEL_OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 impl UiAssets {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, thumbs: std::sync::Arc<crate::thumbs::Thumbs>) -> Self {
         let (primary, fallbacks) = super::fonts::load_font_bytes();
         let atlas = GlyphAtlas::new(device, primary, fallbacks);
         let renderer = UiRenderer::new(device, PANEL_OFFSCREEN_FORMAT);
         let (icon_texture, icon_view) = icons::create_sheet_texture(device, queue);
-        Self { atlas, renderer, icon_texture, icon_view }
+        let (thumb_texture, thumb_view) = crate::thumbs::create_texture(device);
+        Self { atlas, renderer, icon_texture, icon_view, thumb_texture, thumb_view, thumbs }
     }
 }
